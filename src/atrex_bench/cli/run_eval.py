@@ -60,8 +60,11 @@ from atrex_bench.eval.clock_lock import (
 from atrex_bench.eval.clock_monitor import NvidiaClockMonitor
 from atrex_bench.eval.correctness import (
     CORRECTNESS_MAX_REL_L2_ENV,
+    CORRECTNESS_TOLERANCE_POLICY,
     configured_max_rel_l2,
+    validate_error_budgets,
 )
+from atrex_bench.eval.input_cases import INPUT_CONFIG_KEYS, CorrectnessInputConfig
 from atrex_bench.eval.nvidia_clock import NvidiaSmi
 from atrex_bench.eval.reward_hack import (
     RewardHackDetected,
@@ -117,6 +120,7 @@ _RUNNER_CONFIG_SCHEMA_VERSION = "v1"
 _EVAL_MODES = frozenset({_CANDIDATE_EVAL_MODE, _TORCH_COMPILE_EVAL_MODE})
 _RUNNER_CONFIG_KEYS = frozenset(
     {
+        *INPUT_CONFIG_KEYS,
         "schema_version",
         "eval_mode",
         "input",
@@ -126,6 +130,7 @@ _RUNNER_CONFIG_KEYS = frozenset(
         "atol",
         "rtol",
         "correctness_max_rel_l2",
+        "correctness_error_budgets",
         "num_correctness_cases",
         "warmup_iters",
         "bench_iters",
@@ -187,6 +192,7 @@ def _derived_shape_wall_timeout_s(
     perf_timeout_s: int | float,
     *,
     num_correctness_cases: int,
+    correctness_inputs: CorrectnessInputConfig | None = None,
     validation_mode: str = _VALIDATION_MODE_FULL,
 ) -> float:
     """OS-level wall-clock ceiling for a single per-shape sub-worker.
@@ -210,6 +216,8 @@ def _derived_shape_wall_timeout_s(
     C-extension hangs (MLIR compiler, wedged torch.cuda.synchronize) that
     in-Python SIGALRM cannot interrupt.
     """
+    if correctness_inputs is not None:
+        num_correctness_cases = correctness_inputs.case_count(num_correctness_cases)
     correctness_budget = (
         float(candidate_timeout_s) * num_correctness_cases
         if validation_mode != _VALIDATION_MODE_PERFORMANCE_ONLY
@@ -236,6 +244,7 @@ def _derived_worker_wall_timeout_s(
     candidate_timeout_s: int | float,
     perf_timeout_s: int | float,
     num_correctness_cases: int,
+    correctness_inputs: CorrectnessInputConfig | None = None,
     validation_mode: str = _VALIDATION_MODE_FULL,
 ) -> float | None:
     """OS-level wall-clock ceiling for the WHOLE ``--worker`` subprocess.
@@ -267,6 +276,7 @@ def _derived_worker_wall_timeout_s(
         candidate_timeout_s,
         perf_timeout_s,
         num_correctness_cases=num_correctness_cases,
+        correctness_inputs=correctness_inputs,
         validation_mode=validation_mode,
     )
     return (
@@ -652,6 +662,9 @@ def _untrusted_critical_targets() -> dict[str, object]:
         "correctness._compare_output_tensors": correctness_globals.get(
             "_compare_output_tensors"
         ),
+        "correctness._relative_l2": correctness_globals.get("_relative_l2"),
+        "correctness._rms_budget_check": correctness_globals.get("_rms_budget_check"),
+        "correctness._finite_metric": correctness_globals.get("_finite_metric"),
         "correctness.flatten_outputs": correctness_globals.get("flatten_outputs"),
         "correctness.check_plain_tensor_outputs": correctness_globals.get(
             "check_plain_tensor_outputs"
@@ -1163,6 +1176,8 @@ def _build_runner_config(
     atol: float,
     rtol: float,
     num_correctness_cases: int,
+    correctness_error_budgets: dict | None = None,
+    correctness_inputs: CorrectnessInputConfig | None = None,
     warmup_iters: int,
     bench_iters: int,
     candidate_timeout_s: int | float | None = None,
@@ -1176,12 +1191,16 @@ def _build_runner_config(
     require_clock_locked: bool = False,
 ) -> dict[str, object]:
     return {
+        **({"correctness_error_budgets": correctness_error_budgets}
+           if correctness_error_budgets else {}),
+        **(correctness_inputs.to_options() if correctness_inputs is not None else {}),
         "config_version": config_version,
         "mode": mode,
         "validation_mode": validation_mode,
         "atol": atol,
         "rtol": rtol,
         "correctness_max_rel_l2": configured_max_rel_l2(),
+        "correctness_tolerance_policy": CORRECTNESS_TOLERANCE_POLICY,
         "num_correctness_cases": num_correctness_cases,
         "warmup_iters": warmup_iters,
         "bench_iters": bench_iters,
@@ -1751,6 +1770,8 @@ def _build_single_shape_worker_command(
     atol: float,
     rtol: float,
     num_correctness_cases: int,
+    correctness_error_budgets: dict | None = None,
+    correctness_inputs: CorrectnessInputConfig | None = None,
     warmup_iters: int,
     bench_iters: int,
     shape_result_path: Path,
@@ -1821,6 +1842,10 @@ def _build_single_shape_worker_command(
     if not collect_kernel_events:
         argv.append("--skip-kernel-attribution")
     argv.extend(_validation_mode_cli_args(validation_mode))
+    if correctness_inputs is not None:
+        argv.extend(correctness_inputs.cli_args())
+    if correctness_error_budgets:
+        argv.extend(["--correctness-error-budgets", json.dumps(correctness_error_budgets)])
     return argv
 
 
@@ -1875,6 +1900,8 @@ def _run_single_shape_subprocess(
     atol: float,
     rtol: float,
     num_correctness_cases: int,
+    correctness_error_budgets: dict | None = None,
+    correctness_inputs: CorrectnessInputConfig | None = None,
     warmup_iters: int,
     bench_iters: int,
     collect_kernel_events: bool,
@@ -1923,6 +1950,8 @@ def _run_single_shape_subprocess(
         atol=atol,
         rtol=rtol,
         num_correctness_cases=num_correctness_cases,
+        correctness_error_budgets=correctness_error_budgets,
+        correctness_inputs=correctness_inputs,
         warmup_iters=warmup_iters,
         bench_iters=bench_iters,
         shape_result_path=shape_result_path,
@@ -1942,6 +1971,7 @@ def _run_single_shape_subprocess(
         candidate_timeout_s,
         perf_timeout_s,
         num_correctness_cases=num_correctness_cases,
+        correctness_inputs=correctness_inputs,
         validation_mode=validation_mode,
     )
 
@@ -2027,6 +2057,8 @@ def _run_single_shape_main(
     atol: float,
     rtol: float,
     num_correctness_cases: int,
+    correctness_error_budgets: dict | None = None,
+    correctness_inputs: CorrectnessInputConfig | None = None,
     warmup_iters: int,
     bench_iters: int,
     shape_result_path: Path,
@@ -2090,6 +2122,9 @@ def _run_single_shape_main(
             atol=atol,
             rtol=rtol,
             num_correctness_cases=num_correctness_cases,
+            **({"correctness_error_budgets": correctness_error_budgets}
+               if correctness_error_budgets else {}),
+            **({"correctness_inputs": correctness_inputs} if correctness_inputs else {}),
             candidate_timeout_s=candidate_timeout_s,
             untrusted_mode=trust_mode == _TRUST_MODE_UNTRUSTED,
         )
@@ -2506,6 +2541,8 @@ def _run_eval_worker(
     atol: float,
     rtol: float,
     num_correctness_cases: int,
+    correctness_error_budgets: dict | None = None,
+    correctness_inputs: CorrectnessInputConfig | None = None,
     warmup_iters: int,
     bench_iters: int,
     checkpoint_dir: Path | None,
@@ -2536,6 +2573,8 @@ def _run_eval_worker(
         atol=atol,
         rtol=rtol,
         num_correctness_cases=num_correctness_cases,
+        correctness_error_budgets=correctness_error_budgets,
+        correctness_inputs=correctness_inputs,
         warmup_iters=warmup_iters,
         bench_iters=bench_iters,
         candidate_timeout_s=candidate_timeout_s,
@@ -2716,6 +2755,8 @@ def _run_eval_worker(
             atol=atol,
             rtol=rtol,
             num_correctness_cases=num_correctness_cases,
+            correctness_error_budgets=correctness_error_budgets,
+            correctness_inputs=correctness_inputs,
             warmup_iters=warmup_iters,
             bench_iters=bench_iters,
             collect_kernel_events=collect_kernel_events,
@@ -3001,6 +3042,8 @@ def _run_eval_process(
     atol: float = 1e-2,
     rtol: float = 0.05,
     num_correctness_cases: int = 1,
+    correctness_error_budgets: dict | None = None,
+    correctness_inputs: CorrectnessInputConfig | None = None,
     warmup_iters: int = 10,
     bench_iters: int = 100,
     checkpoint_dir: Path | None = None,
@@ -3042,6 +3085,8 @@ def _run_eval_process(
         atol=atol,
         rtol=rtol,
         num_correctness_cases=num_correctness_cases,
+        correctness_error_budgets=correctness_error_budgets,
+        correctness_inputs=correctness_inputs,
         warmup_iters=warmup_iters,
         bench_iters=bench_iters,
         candidate_timeout_s=candidate_timeout_s,
@@ -3116,6 +3161,12 @@ def _run_eval_process(
         "--artifact-dir",
         str(artifact_dir),
     ]
+    if correctness_error_budgets:
+        worker_command.extend([
+            "--correctness-error-budgets", json.dumps(correctness_error_budgets)
+        ])
+    if correctness_inputs is not None:
+        worker_command.extend(correctness_inputs.cli_args())
     if graph_min_cosine is not None:
         worker_command.extend(["--graph-min-cosine", str(graph_min_cosine)])
     if graph_max_rel_l2 is not None:
@@ -3144,6 +3195,7 @@ def _run_eval_process(
         candidate_timeout_s=candidate_timeout_s,
         perf_timeout_s=perf_timeout_s,
         num_correctness_cases=num_correctness_cases,
+        correctness_inputs=correctness_inputs,
         validation_mode=validation_mode,
     )
     compile_ready_path = artifact_dir / _COMPILE_READY_FILENAME
@@ -3461,6 +3513,20 @@ def run_eval(
     atol: float = 1e-2,
     rtol: float = 0.05,
     num_correctness_cases: int = 1,
+    correctness_error_budgets: dict | None = None,
+    correctness_seeds: list[int] | None = None,
+    correctness_wide_uniform: dict | None = None,
+    correctness_sparse_outliers: dict | None = None,
+    correctness_log_uniform: dict | None = None,
+    correctness_cross_rank_cancellation: dict | None = None,
+    correctness_zeros: dict | None = None,
+    correctness_tiny_values: dict | None = None,
+    correctness_nonlinear_saturation: dict | None = None,
+    correctness_routing_all_ties: dict | None = None,
+    correctness_rounding_near_ties: dict | None = None,
+    correctness_signed_scale: dict | None = None,
+    correctness_zero_scale: dict | None = None,
+    correctness_fp4_extreme_codes: dict | None = None,
     warmup_iters: int = 10,
     bench_iters: int = 100,
     checkpoint_dir: Path | None = None,
@@ -3483,6 +3549,21 @@ def run_eval(
     validation_mode: str = _VALIDATION_MODE_FULL,
 ) -> dict[str, object]:
     """Run candidate evaluation under one optional parent clock lock."""
+    correctness_error_budgets = validate_error_budgets(correctness_error_budgets)
+    if correctness_error_budgets:
+        if validation_mode == _VALIDATION_MODE_PERFORMANCE_ONLY:
+            raise ValueError("Correctness error budgets require correctness evaluation")
+        if configured_max_rel_l2() is not None:
+            raise ValueError("correctness_error_budgets cannot be combined with max_rel_l2")
+    options = locals()
+    correctness_inputs = CorrectnessInputConfig.from_options(
+        {key: options[key] for key in INPUT_CONFIG_KEYS}
+    )
+    if correctness_inputs is not None:
+        if num_correctness_cases < 1:
+            raise ValueError("num_correctness_cases must be at least 1")
+        if validation_mode == _VALIDATION_MODE_PERFORMANCE_ONLY:
+            raise ValueError("Correctness input options require correctness evaluation")
     input_path = input_path.resolve()
     reference_dir = reference_dir.resolve()
     output_root = output_root.resolve()
@@ -3508,6 +3589,8 @@ def run_eval(
             atol=atol,
             rtol=rtol,
             num_correctness_cases=num_correctness_cases,
+            correctness_error_budgets=correctness_error_budgets,
+            correctness_inputs=correctness_inputs,
             warmup_iters=warmup_iters,
             bench_iters=bench_iters,
             candidate_timeout_s=candidate_timeout_s,
@@ -3540,6 +3623,8 @@ def run_eval(
             atol=atol,
             rtol=rtol,
             num_correctness_cases=num_correctness_cases,
+            correctness_error_budgets=correctness_error_budgets,
+            correctness_inputs=correctness_inputs,
             warmup_iters=warmup_iters,
             bench_iters=bench_iters,
             checkpoint_dir=checkpoint_dir,
@@ -3700,7 +3785,10 @@ def main() -> None:
         dest="validation_mode",
         help="Run candidate compile and performance stages only.",
     )
-    parser.add_argument("--atol", type=float, default=None, help="Absolute tolerance")
+    parser.add_argument(
+        "--atol", type=float, default=None,
+        help="Absolute tolerance for near-zero outputs",
+    )
     parser.add_argument("--rtol", type=float, default=None, help="Relative tolerance")
     parser.add_argument(
         "--correctness-max-rel-l2",
@@ -3717,6 +3805,21 @@ def main() -> None:
         default=None,
         help="Number of correctness cases per shape",
     )
+    parser.add_argument(
+        "--correctness-error-budgets", type=json.loads, default=None,
+        help="Per-output JSON tolerances and optional RMS budgets (rms_atol, rms_rtol, dim).",
+    )
+    for key in INPUT_CONFIG_KEYS:
+        parser.add_argument(
+            "--" + key.replace("_", "-"),
+            type=json.loads,
+            default=None,
+            help=(
+                "JSON seed list; expands correctness draws per seed."
+                if key == "correctness_seeds" else
+                "Opt-in correctness profile JSON with explicit inputs; false disables it."
+            ),
+        )
     parser.add_argument(
         "--warmup-iters",
         type=int,
@@ -4070,6 +4173,32 @@ def main() -> None:
             default=_DEFAULT_NUM_CORRECTNESS_CASES,
         )
     )
+    try:
+        correctness_inputs = CorrectnessInputConfig.from_options({
+            key: _resolve_runner_option(
+                key, cli_value=getattr(args, key), config=runner_file_config, default=None
+            )
+            for key in INPUT_CONFIG_KEYS
+        })
+        if correctness_inputs is not None:
+            if args.num_correctness_cases < 1:
+                raise ValueError("num_correctness_cases must be at least 1")
+            if args.torch_compile or args.validation_mode == _VALIDATION_MODE_PERFORMANCE_ONLY:
+                raise ValueError("Correctness input options require correctness evaluation")
+    except (TypeError, ValueError) as error:
+        raise SystemExit(str(error)) from error
+    try:
+        args.correctness_error_budgets = validate_error_budgets(_resolve_runner_option(
+            "correctness_error_budgets", cli_value=args.correctness_error_budgets,
+            config=runner_file_config, default=None,
+        ))
+        if args.correctness_error_budgets:
+            if args.torch_compile or args.validation_mode == _VALIDATION_MODE_PERFORMANCE_ONLY:
+                raise ValueError("Correctness error budgets require correctness evaluation")
+            if configured_max_rel_l2(args.correctness_max_rel_l2) is not None:
+                raise ValueError("correctness_error_budgets cannot be combined with max_rel_l2")
+    except (TypeError, ValueError) as error:
+        raise SystemExit(str(error)) from error
     args.warmup_iters = int(
         _resolve_runner_option(
             "warmup_iters",
@@ -4258,6 +4387,8 @@ def main() -> None:
             atol=args.atol,
             rtol=args.rtol,
             num_correctness_cases=args.num_correctness_cases,
+            correctness_error_budgets=args.correctness_error_budgets,
+            correctness_inputs=correctness_inputs,
             warmup_iters=args.warmup_iters,
             bench_iters=args.bench_iters,
             shape_result_path=args.shape_result_output,
@@ -4304,6 +4435,8 @@ def main() -> None:
             atol=args.atol,
             rtol=args.rtol,
             num_correctness_cases=args.num_correctness_cases,
+            correctness_error_budgets=args.correctness_error_budgets,
+            correctness_inputs=correctness_inputs,
             warmup_iters=args.warmup_iters,
             bench_iters=args.bench_iters,
             checkpoint_dir=args.checkpoint_dir,
@@ -4374,6 +4507,8 @@ def main() -> None:
         atol=args.atol,
         rtol=args.rtol,
         num_correctness_cases=args.num_correctness_cases,
+        correctness_error_budgets=args.correctness_error_budgets,
+        **(correctness_inputs.to_options() if correctness_inputs else {}),
         warmup_iters=args.warmup_iters,
         bench_iters=args.bench_iters,
         checkpoint_dir=args.checkpoint_dir,

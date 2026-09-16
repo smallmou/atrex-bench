@@ -22,7 +22,10 @@ def main() -> int:
         required=True,
         help="Path to the candidate Python file",
     )
-    parser.add_argument("--atol", type=float, default=1e-2, help="Absolute tolerance")
+    parser.add_argument(
+        "--atol", type=float, default=1e-2,
+        help="Absolute tolerance for near-zero outputs",
+    )
     parser.add_argument("--rtol", type=float, default=5e-2, help="Relative tolerance")
     parser.add_argument(
         "--num-correctness-cases",
@@ -43,6 +46,10 @@ def main() -> int:
         default=None,
         help="Relative or absolute directory for correctness input checkpoints",
     )
+    parser.add_argument(
+        "--correctness-error-budgets", type=json.loads, default=None,
+        help="Per-output JSON tolerances and optional RMS budgets (rms_atol, rms_rtol, dim).",
+    )
     args = parser.parse_args()
     artifact_dir = None
     artifact_root = None
@@ -61,6 +68,7 @@ def main() -> int:
             candidate_path=args.candidate,
             atol=args.atol,
             rtol=args.rtol,
+            correctness_error_budgets=args.correctness_error_budgets,
             num_correctness_cases=args.num_correctness_cases,
             device=args.device,
             artifact_dir=artifact_dir,

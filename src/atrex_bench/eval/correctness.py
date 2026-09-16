@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import math
 import os
 import traceback
 from dataclasses import dataclass, field, replace
@@ -14,7 +15,6 @@ import torch
 from atrex_bench.eval._runtime import (
     ShapeSpec,
     clone_model_inputs,
-    deterministic_input_seed,
     flatten_outputs,
     get_device,
     instantiate_model_pair,
@@ -26,6 +26,7 @@ from atrex_bench.eval._runtime import (
     write_input_artifact,  # noqa: F401 - backward-compatible module export
 )
 from atrex_bench.eval._timeout import CandidateTimeoutError, candidate_timeout
+from atrex_bench.eval.input_cases import CorrectnessInputConfig, apply_input_case
 from atrex_bench.eval.reward_hack import (
     RewardHackDetected,
     check_plain_tensor_outputs,
@@ -33,6 +34,7 @@ from atrex_bench.eval.reward_hack import (
 
 _DEFAULT_CANDIDATE_TIMEOUT_S = 60
 CORRECTNESS_MAX_REL_L2_ENV = "ATREX_CORRECTNESS_MAX_REL_L2"
+CORRECTNESS_TOLERANCE_POLICY = "mixed_with_optional_rms_v1"
 
 
 @dataclass(frozen=True)
@@ -51,6 +53,7 @@ class OutputDiff:
     max_elementwise_abs_diff: float | None = None
     max_elementwise_rel_diff: float | None = None
     relative_l2: float | None = None
+    max_rms_error_ratio: float | None = None
     error: str | None = None
 
 
@@ -58,13 +61,12 @@ class OutputDiff:
 class CorrectnessCase:
     """One correctness case: a single random input draw.
 
-    ``input_artifact`` is the only per-case input information persisted in
-    eval_result.json — the actual random tensor values live in the .pt file.
-    Everything else (init_kwargs, input_kwargs) is derivable from
-    shapes.json + input.py, so it is not duplicated here.
+    ``input_artifact`` records the seed and, for opt-in distributions, the
+    versioned profile and parameters. Replay uses shapes.json + input.py;
+    full tensor payloads are not persisted.
     """
 
-    input_artifact: dict[str, str] | None
+    input_artifact: dict[str, object] | None
     outputs: list[OutputDiff] = field(default_factory=list)
     mutated_inputs: list[OutputDiff] = field(default_factory=list)
     unexpected_mutations: list[OutputDiff] = field(default_factory=list)
@@ -205,9 +207,91 @@ def configured_max_rel_l2(explicit: float | None = None) -> float | None:
         if raw is None or not raw.strip():
             return None
         value = float(raw)
-    if value < 0:
-        raise ValueError("correctness max_rel_l2 must be non-negative")
+    if not math.isfinite(value) or value < 0:
+        raise ValueError("correctness max_rel_l2 must be finite and non-negative")
     return value
+
+
+def _finite_metric(value: float) -> float | None:
+    """Keep undefined/unrepresentable error metrics JSON-compatible."""
+    return value if math.isfinite(value) else None
+
+
+def _relative_l2(reference: torch.Tensor, candidate: torch.Tensor) -> float | None:
+    """Relative L2 for finite float64 tensors without a magnitude-dependent floor.
+
+    Normalize before taking norms to avoid squaring tiny/large values. A zero
+    reference with a nonzero candidate has undefined relative error (None),
+    which fails any relative-L2 threshold.
+    """
+    if reference.numel() == 0:
+        return 0.0
+    scale = torch.maximum(reference.abs().max(), candidate.abs().max())
+    if scale.item() == 0:
+        return 0.0
+    reference_scaled = reference / scale
+    candidate_scaled = candidate / scale
+    reference_norm = torch.linalg.vector_norm(reference_scaled)
+    if reference_norm.item() == 0:
+        return None
+    difference_norm = torch.linalg.vector_norm(candidate_scaled - reference_scaled)
+    return _finite_metric(float((difference_norm / reference_norm).item()))
+
+
+def validate_error_budgets(value: dict | None) -> dict | None:
+    """Validate per-output tolerances; an RMS guard requires an explicit noise budget."""
+    if value is None or value == {}:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("correctness_error_budgets must be an object keyed by output name")
+    normalized = {}
+    for name, budget in value.items():
+        if not isinstance(name, str) or not name or not isinstance(budget, dict) or not budget:
+            raise ValueError("Each correctness error budget needs an output name and parameters")
+        unknown = budget.keys() - {"atol", "rtol", "rms_atol", "rms_rtol", "dim"}
+        if unknown:
+            raise ValueError(f"{name}: unknown error budget parameters: {sorted(unknown)}")
+        has_rms = "rms_atol" in budget or "rms_rtol" in budget
+        if has_rms and not {"rms_atol", "rms_rtol"} <= budget.keys():
+            raise ValueError(f"{name}: specify both rms_atol and rms_rtol")
+        if "dim" in budget and not has_rms:
+            raise ValueError(f"{name}: dim requires an RMS budget")
+        for key, number in budget.items():
+            if key == "dim":
+                if number is not None and type(number) is not int:
+                    raise ValueError(f"{name}.dim must be an integer or null")
+            elif type(number) not in (int, float) or not math.isfinite(number) or number < 0:
+                raise ValueError(f"{name}.{key} must be finite and non-negative")
+        normalized[name] = dict(budget)
+    return normalized
+
+
+def _rms_budget_check(
+    reference: torch.Tensor, candidate: torch.Tensor, budget: dict
+) -> tuple[bool, float | None]:
+    """Check RMS(error) <= rms_atol + rms_rtol * RMS(reference), per group.
+
+    With dim=None the group is the whole output; otherwise reduce along that
+    axis and require every remaining group to pass. Scale before squaring so
+    the absolute noise budget works for tiny and large outputs alike.
+    """
+    dim = budget.get("dim")
+    if dim is not None and not -reference.ndim <= dim < reference.ndim:
+        raise ValueError("RMS budget dim is outside output dimensions")
+    if reference.numel() == 0:
+        return True, 0.0
+    scale = torch.maximum(
+        reference.abs().amax(dim=dim, keepdim=True),
+        candidate.abs().amax(dim=dim, keepdim=True),
+    )
+    scale = torch.where(scale == 0, 1.0, scale)
+    reference_scaled = reference / scale
+    candidate_scaled = candidate / scale
+    error_rms = (candidate_scaled - reference_scaled).square().mean(dim=dim, keepdim=True).sqrt()
+    reference_rms = reference_scaled.square().mean(dim=dim, keepdim=True).sqrt()
+    limit = budget["rms_atol"] / scale + budget["rms_rtol"] * reference_rms
+    ratio = torch.where(error_rms == 0, 0.0, error_rms / limit)
+    return bool((error_rms <= limit).all().item()), _finite_metric(float(ratio.max().item()))
 
 
 def _compare_output_tensors(
@@ -219,6 +303,7 @@ def _compare_output_tensors(
     rtol: float,
     max_rel_l2: float | None = None,
     strict_dtype: bool = False,
+    error_budget: dict | None = None,
 ) -> OutputDiff:
     """Compare a pair of output tensors and return the per-output diff record."""
     if strict_dtype and reference_tensor.dtype != candidate_tensor.dtype:
@@ -239,6 +324,14 @@ def _compare_output_tensors(
         )
 
     error: str | None = None
+    max_rms_error_ratio = None
+    if error_budget is not None:
+        if max_rel_l2 is not None:
+            raise ValueError("correctness_error_budgets cannot be combined with max_rel_l2")
+        if not torch.is_floating_point(reference_tensor):
+            raise ValueError(f"Error budget for {name} requires a floating-point reference output")
+        atol = error_budget.get("atol", atol)
+        rtol = error_budget.get("rtol", rtol)
     if torch.is_floating_point(reference_tensor) or torch.is_floating_point(candidate_tensor):
         reference_float = reference_tensor.detach().to(torch.float64)
         candidate_float = candidate_tensor.detach().to(torch.float64)
@@ -257,32 +350,51 @@ def _compare_output_tensors(
                 ),
             )
 
-        reference_norm = torch.linalg.vector_norm(reference_float)
-        candidate_norm = torch.linalg.vector_norm(candidate_float)
-        candidate_is_zero = (
-            float(reference_norm.item()) > 0.0 and float(candidate_norm.item()) == 0.0
+        reference_abs = reference_float.abs()
+        reference_nonzero = reference_abs != 0
+        candidate_is_zero = bool(
+            reference_nonzero.any().item() and not candidate_float.ne(0).any().item()
         )
-
-        abs_diff = (reference_float - candidate_float).abs()
-        max_elementwise_abs_diff = float(abs_diff.max().item()) if abs_diff.numel() else 0.0
-        denominator = reference_float.abs().clamp_min(max(atol, 1e-12))
+        abs_diff = (candidate_float - reference_float).abs()
+        max_elementwise_abs_diff = (
+            _finite_metric(float(abs_diff.max().item())) if abs_diff.numel() else 0.0
+        )
+        relative_errors = abs_diff / reference_abs
+        # Opposite-sign finite values can overflow subtraction even though
+        # their relative error (e.g. 2) is representable.
+        relative_errors = torch.where(
+            torch.isinf(abs_diff) & reference_nonzero,
+            (candidate_float / reference_float - 1).abs(),
+            relative_errors,
+        )
+        relative_errors = torch.where(
+            reference_nonzero,
+            relative_errors,
+            torch.where(candidate_float == 0, 0.0, float("inf")),
+        )
         max_elementwise_rel_diff = (
-            float((abs_diff / denominator).max().item()) if abs_diff.numel() else 0.0
+            _finite_metric(float(relative_errors.max().item())) if abs_diff.numel() else 0.0
         )
-        diff_l2 = torch.linalg.vector_norm(reference_float - candidate_float)
-        relative_l2 = float((diff_l2 / reference_norm.clamp_min(1e-12)).item())
-        passed = (
-            relative_l2 <= max_rel_l2
-            if max_rel_l2 is not None
-            else bool(
-                torch.allclose(
-                    reference_float,
-                    candidate_float,
-                    atol=atol,
-                    rtol=rtol,
-                )
+        relative_l2 = _relative_l2(reference_float, candidate_float)
+        if max_rel_l2 is not None:
+            passed = relative_l2 is not None and relative_l2 <= max_rel_l2
+        else:
+            # Normalize each element's mixed tolerance to avoid overflow. A
+            # tiny reference versus a huge candidate must not become inf <= inf.
+            scale = torch.maximum(reference_abs, candidate_float.abs())
+            scale = torch.where(scale == 0, 1.0, scale)
+            normalized_error = torch.where(
+                torch.isinf(abs_diff),
+                (candidate_float / scale - reference_float / scale).abs(),
+                abs_diff / scale,
             )
-        )
+            limit = atol / scale + rtol * (reference_abs / scale)
+            passed = bool((normalized_error <= limit).all().item())
+            if error_budget is not None and "rms_atol" in error_budget:
+                rms_passed, max_rms_error_ratio = _rms_budget_check(
+                    reference_float, candidate_float, error_budget
+                )
+                passed = passed and rms_passed
         if candidate_is_zero and not passed:
             error = "Candidate output is all zero while reference output is non-zero"
     else:
@@ -297,12 +409,14 @@ def _compare_output_tensors(
         max_elementwise_abs_diff=max_elementwise_abs_diff,
         max_elementwise_rel_diff=max_elementwise_rel_diff,
         relative_l2=relative_l2,
+        max_rms_error_ratio=max_rms_error_ratio,
         error=error,
     )
 
 
 def _compare_value_trees(
-    reference, candidate, *, name, atol, rtol, max_rel_l2=None, strict_types=False
+    reference, candidate, *, name, atol, rtol, max_rel_l2=None, strict_types=False,
+    error_budgets=None,
 ):
     """Compare return values, with exact types for explicit mutation contracts."""
     try:
@@ -323,6 +437,7 @@ def _compare_value_trees(
                 rtol=rtol,
                 max_rel_l2=max_rel_l2,
                 strict_types=strict_types,
+                error_budgets=error_budgets,
             )
         ]
     if isinstance(reference, (list, tuple)):
@@ -337,14 +452,22 @@ def _compare_value_trees(
                 rtol=rtol,
                 max_rel_l2=max_rel_l2,
                 strict_types=strict_types,
+                error_budgets=error_budgets,
             )
         ]
+    budgets = error_budgets or {}
+    output_name = _flatten_output_name(name)
+    budget = budgets.get(output_name, budgets.get("*"))
+    if reference is None and output_name in budgets:
+        raise ValueError(f"Error budget for {name} requires a floating-point reference output")
     if reference is None:
         return [OutputDiff(name=name, passed=True)]
     # Retain legacy scalar conversion and tolerance semantics as well as
     # list/tuple interoperability for benchmarks without an explicit contract.
     reference_tensor = flatten_outputs(reference)[0][1]
     candidate_tensor = flatten_outputs(candidate)[0][1]
+    if not torch.is_floating_point(reference_tensor) and output_name not in budgets:
+        budget = None  # Wildcard budgets cover floating outputs; integers stay exact.
     return [
         _compare_output_tensors(
             reference_tensor,
@@ -354,6 +477,7 @@ def _compare_value_trees(
             rtol=rtol,
             max_rel_l2=max_rel_l2,
             strict_dtype=strict_types,
+            error_budget=budget,
         )
     ]
 
@@ -416,6 +540,8 @@ def check_correctness(
     candidate_timeout_s: int | float | None = _DEFAULT_CANDIDATE_TIMEOUT_S,
     max_rel_l2: float | None = None,
     untrusted_mode: bool = False,
+    correctness_inputs: CorrectnessInputConfig | None = None,
+    correctness_error_budgets: dict | None = None,
 ) -> CorrectnessShapeResult:
     """Compare candidate outputs against the eager reference baseline for one shape.
 
@@ -431,6 +557,9 @@ def check_correctness(
         )
     try:
         effective_max_rel_l2 = configured_max_rel_l2(max_rel_l2)
+        correctness_error_budgets = validate_error_budgets(correctness_error_budgets)
+        if correctness_error_budgets and effective_max_rel_l2 is not None:
+            raise ValueError("correctness_error_budgets cannot be combined with max_rel_l2")
     except ValueError as error:
         return CorrectnessShapeResult(status="failed", reason=str(error))
 
@@ -463,6 +592,10 @@ def check_correctness(
             reason=traceback.format_exc(),
         )
 
+    case_plan = (correctness_inputs or CorrectnessInputConfig()).cases(
+        shape_id, num_correctness_cases
+    )
+    total_cases = len(case_plan)
     case_records: list[CorrectnessCase] = []
     failed_cases = 0
     # Surfaced into CorrectnessShapeResult.reason for the deterministic-failure
@@ -489,26 +622,27 @@ def check_correctness(
         """
         nonlocal failed_cases, early_abort_reason
         early_abort_reason = short_reason
-        skipped = num_correctness_cases - (after_case_index + 1)
+        skipped = total_cases - (after_case_index + 1)
         if skipped <= 0:
             return
         failed_cases += skipped
         reason = f"skipped after case {after_case_index} failed deterministically: {short_reason}"
-        for _ in range(skipped):
-            case_records.append(CorrectnessCase(input_artifact=None, error=reason))
+        for planned_case in case_plan[after_case_index + 1:]:
+            artifact = planned_case.artifact() if correctness_inputs is not None else None
+            case_records.append(CorrectnessCase(input_artifact=artifact, error=reason))
 
-    for case_index in range(num_correctness_cases):
-        # Seed every RNG just before generating inputs so the random tensors
-        # are reproducible from the recorded seed alone (no .pt files needed).
-        seed = deterministic_input_seed("correctness", shape_id, case_index)
-        seed_all_input_rngs(seed)
-        if shape is not None:
-            inputs = load_shape_call_inputs(loaded_models.input_module, shape, resolved_device)
-        else:
-            inputs = load_reference_inputs(loaded_models.input_module, resolved_device)
-        artifact = {"seed": seed, "format": "manual_seed"}
-
+    for case_index, input_case in enumerate(case_plan):
+        artifact = input_case.artifact()
+        failure_stage = "input generation/profile"
         try:
+            seed_all_input_rngs(input_case.seed)
+            if shape is not None:
+                inputs = load_shape_call_inputs(loaded_models.input_module, shape, resolved_device)
+            else:
+                inputs = load_reference_inputs(loaded_models.input_module, resolved_device)
+            if input_case.profile is not None:
+                apply_input_case(inputs, signature, input_case)
+            failure_stage = "candidate"
             reference_call_inputs = clone_model_inputs(inputs)
             candidate_call_inputs = clone_model_inputs(inputs)
 
@@ -584,10 +718,19 @@ def check_correctness(
                 rtol=rtol,
                 max_rel_l2=effective_max_rel_l2,
                 strict_types=strict_types,
+                error_budgets=correctness_error_budgets,
             )
             output_diffs = [
                 replace(diff, name=_flatten_output_name(diff.name)) for diff in output_diffs
             ]
+            if correctness_error_budgets:
+                unknown = correctness_error_budgets.keys() - {"*"} - {
+                    diff.name for diff in output_diffs
+                }
+                if unknown:
+                    raise ValueError(
+                        f"Unknown correctness output budget target(s): {sorted(unknown)}"
+                    )
             reference_named = named(reference_call_inputs)
             candidate_named = named(candidate_call_inputs)
             mutation_diffs = []
@@ -645,7 +788,7 @@ def check_correctness(
                     error=tb,
                 )
             )
-            _abort_remaining_cases(case_index, "candidate raised exception")
+            _abort_remaining_cases(case_index, f"{failure_stage} raised exception")
             break
 
     if failed_cases == 0:
@@ -653,7 +796,7 @@ def check_correctness(
         reason: str | None = None
     else:
         status = "failed"
-        base = f"{failed_cases}/{num_correctness_cases} correctness cases failed"
+        base = f"{failed_cases}/{total_cases} correctness cases failed"
         if early_abort_reason is not None:
             reason = f"{base}: {early_abort_reason}"
         else:

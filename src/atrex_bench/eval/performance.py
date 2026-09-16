@@ -33,6 +33,7 @@ from atrex_bench.eval._runtime import (
 )
 from atrex_bench.eval._timeout import CandidateTimeoutError, candidate_timeout
 from atrex_bench.eval.correctness import (
+    CORRECTNESS_TOLERANCE_POLICY,
     _compare_output_tensors,
     _flatten_output_name,
 )
@@ -397,7 +398,7 @@ def _compare_graph_outputs(
         }
         policy = {key: value for key, value in policy.items() if value is not None}
     else:
-        policy = {"type": "allclose", "atol": atol, "rtol": rtol}
+        policy = {"type": CORRECTNESS_TOLERANCE_POLICY, "atol": atol, "rtol": rtol}
     graph_outputs = flatten_outputs(graph_output)
     if len(eager_snapshot) != len(graph_outputs):
         return {
@@ -435,6 +436,7 @@ def _compare_graph_outputs(
             )
         )
         output_diff["cosine_similarity"] = None
+        relative_l2 = output_diff["relative_l2"]
         output_diff["relative_l2"] = None
         if (min_cosine is not None or max_rel_l2 is not None) and (
             torch.is_floating_point(eager_tensor)
@@ -443,8 +445,8 @@ def _compare_graph_outputs(
             if eager_tensor.shape != graph_tensor.shape:
                 output_diff["passed"] = False
             else:
-                eager_float = eager_tensor.detach().float().flatten()
-                graph_float = graph_tensor.detach().float().flatten()
+                eager_float = eager_tensor.detach().to(torch.float64).flatten()
+                graph_float = graph_tensor.detach().to(torch.float64).flatten()
                 finite = bool(
                     torch.isfinite(eager_float).all()
                     and torch.isfinite(graph_float).all()
@@ -457,25 +459,25 @@ def _compare_graph_outputs(
                     output_diff["relative_l2"] = 0.0
                     output_diff["passed"] = True
                 else:
-                    denominator = eager_float.norm() * graph_float.norm()
-                    if float(denominator.item()) == 0.0:
+                    # Normalize each vector before cosine to avoid overflow or
+                    # underflow at otherwise valid output magnitudes.
+                    eager_scale = eager_float.abs().max()
+                    graph_scale = graph_float.abs().max()
+                    if eager_scale.item() == 0 or graph_scale.item() == 0:
                         cosine = 1.0 if torch.equal(eager_float, graph_float) else 0.0
                     else:
+                        eager_unit = eager_float / eager_scale
+                        graph_unit = graph_float / graph_scale
                         cosine = float(
-                            torch.dot(eager_float, graph_float).div(denominator).item()
+                            (torch.dot(eager_unit, graph_unit)
+                             / (eager_unit.norm() * graph_unit.norm())).clamp(-1, 1).item()
                         )
-                    relative_l2_denominator = eager_float.norm().clamp_min(1e-12)
-                    relative_l2 = float(
-                        (eager_float - graph_float)
-                        .norm()
-                        .div(relative_l2_denominator)
-                        .item()
-                    )
                     output_diff["cosine_similarity"] = cosine
                     output_diff["relative_l2"] = relative_l2
                     cosine_passed = min_cosine is None or cosine >= min_cosine
                     rel_l2_passed = (
-                        max_rel_l2 is None or relative_l2 <= max_rel_l2
+                        max_rel_l2 is None
+                        or (relative_l2 is not None and relative_l2 <= max_rel_l2)
                     )
                     output_diff["passed"] = cosine_passed and rel_l2_passed
         output_diffs.append(output_diff)
