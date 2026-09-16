@@ -375,6 +375,7 @@ def _compare_output_tensors(
         max_elementwise_rel_diff = (
             _finite_metric(float(relative_errors.max().item())) if abs_diff.numel() else 0.0
         )
+        del relative_errors, reference_nonzero
         relative_l2 = _relative_l2(reference_float, candidate_float)
         if max_rel_l2 is not None:
             passed = relative_l2 is not None and relative_l2 <= max_rel_l2
@@ -390,6 +391,9 @@ def _compare_output_tensors(
             )
             limit = atol / scale + rtol * (reference_abs / scale)
             passed = bool((normalized_error <= limit).all().item())
+            # Large carried states can occupy gigabytes. These elementwise
+            # intermediates are no longer needed when the RMS reduction starts.
+            del reference_abs, abs_diff, scale, normalized_error, limit
             if error_budget is not None and "rms_atol" in error_budget:
                 rms_passed, max_rms_error_ratio = _rms_budget_check(
                     reference_float, candidate_float, error_budget
@@ -710,6 +714,7 @@ def check_correctness(
                 _abort_remaining_cases(case_index, "output structure mismatch")
                 break
 
+            failure_stage = "output comparison"
             output_diffs = _compare_value_trees(
                 reference_output,
                 candidate_output,
@@ -775,6 +780,12 @@ def check_correctness(
             if has_structural_failure:
                 _abort_remaining_cases(case_index, "per-tensor shape/structural mismatch")
                 break
+            # Do not keep the previous case's input/state copies alive while
+            # allocating the next seed/profile. Diff records contain only scalars.
+            del inputs, reference_call_inputs, candidate_call_inputs
+            del reference_output, candidate_output
+            del original_named, reference_named, candidate_named
+            before = state = None
         except Exception:
             # Any other exception in the case body (e.g. candidate raised an
             # OOM, kernel launch error, AttributeError on .Model, etc.) is
