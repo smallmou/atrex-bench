@@ -36,6 +36,9 @@ start an evaluation, the subprocess fails abnormally, or the result artifacts ar
 | `output` | path | Always | Root directory for evaluation artifacts. |
 | `checkpoint_dir` | path | Optional | Root directory for correctness/performance checkpoints. |
 | `accuracy_mode` | enum | Optional | `allclose` (default) or `flashinfer`; selects the correctness verdict engine. See Section 4.1. |
+| `<profile_name>` | bool | Optional | One kernel accuracy profile key set to `true` (e.g. `nvfp4_attention`, `nvfp4_gemm`; full list in Section 4.1). Implies `accuracy_mode=flashinfer`. At most one may be enabled. |
+| `accuracy_arch` | enum | Optional | `auto` (default), `sm80`, `sm89`, `sm90`, `sm100`, or `sm120`; selects the arch-specific thresholds of the enabled profile. See Section 4.1. |
+| `accuracy_max_mean_abs_err` | float | Optional | `flashinfer` mode only: ceiling on the mean elementwise absolute error. Unset disables the criterion. |
 | `accuracy_max_mismatch_pct` | float | Optional | `flashinfer` mode only: allowed percentage of elements failing the elementwise criterion. Default `0.0`. |
 | `accuracy_min_cos_sim` | float | Optional | `flashinfer` mode only: cosine-similarity floor. Default `0.999`; `<= -1.0` disables. |
 
@@ -79,6 +82,9 @@ result; partial runs remain available as artifacts but are not aggregated.
 | `--accuracy-mode` | enum | `allclose` | Allowed values: `allclose`, `flashinfer`. Selects the correctness verdict engine; see Section 4.1. |
 | `--accuracy-max-mismatch-pct` | float | `0.0` | `accuracy-mode=flashinfer`. Percentage of elements allowed to fail the elementwise isclose criterion. `100.0` makes the verdict cosine-only. |
 | `--accuracy-min-cos-sim` | float | `0.999` | `accuracy-mode=flashinfer`. Cosine-similarity floor for floating-point outputs. A value `<= -1.0` disables the criterion. |
+| `--accuracy-max-mean-abs-err` | float | Unset | `accuracy-mode=flashinfer`. Ceiling on the mean elementwise absolute error (FlashInfer's SM120 NVFP4-attention criterion). Unset disables. |
+| `--accuracy-arch` | enum | `auto` | Allowed values: `auto`, `sm80`, `sm89`, `sm90`, `sm100`, `sm120`. Hardware bucket for the kernel profile flags; `auto` detects the CUDA compute capability. |
+| Kernel profile flags | bool flags | Unset | Mutually exclusive: `--bf16-attention`, `--fp16-attention`, `--fp8-attention`, `--nvfp4-attention`, `--bf16-gemm`, `--fp8-gemm`, `--mxfp8-gemm`, `--nvfp4-gemm`, `--nvfp4-moe`, `--mxint4-moe`, `--fp8-block-moe`, `--fp8-tensor-moe`. Each applies FlashInfer's published criteria for that kernel class; see Section 4.1. |
 | `--num-correctness-cases` | int | `1` | Number of correctness cases per shape. |
 | `--warmup-iters` | int | `10` | Performance warmup budget. **In `eager` mode, the unit is milliseconds, not iterations** (the `warmup` argument to Triton's `do_bench`, documented as "Warmup time (in ms)"). In `cuda_graph_replay` mode, it is the number of replays. |
 | `--bench-iters` | int | `100` | Performance benchmark budget. **In `eager` mode, the unit is milliseconds, not iterations** (the `rep` argument to `do_bench`, documented as "Repetition time (in ms)"). Thus, `--bench-iters 100` requests approximately 100 ms of measurement: a fast kernel may run thousands of times, while a slow kernel may run only once. The length of `samples` in `eval_result.json` gives the recorded sample count. In `cuda_graph_replay` mode, this option is the number of replays. The option name predates this distinction and is retained for compatibility. |
@@ -151,6 +157,55 @@ Additional semantics:
   worker subprocesses via `ATREX_ACCURACY_*` environment variables, the same
   channel as `ATREX_CORRECTNESS_MAX_REL_L2`. It applies uniformly to
   candidate, ABBA, and mutated-input comparisons.
+
+#### Kernel accuracy profiles (per kernel class x per hardware)
+
+Each profile flag applies FlashInfer's published criteria for one kernel
+class, so callers don't hand-assemble thresholds. A flag implies
+`--accuracy-mode flashinfer`; explicitly supplied `--atol`, `--rtol`, and
+`--accuracy-*` knobs override the profile value for that knob (precedence:
+explicit CLI/config > profile > built-in default). Profile flags are mutually
+exclusive with each other, with `--accuracy-mode allclose`, and with
+`--correctness-max-rel-l2`. Config files enable a profile with its boolean
+key (`"nvfp4_gemm": true`); at most one may be set.
+
+`--accuracy-arch` selects the hardware bucket (`auto` maps CUDA compute
+capability 12.x -> `sm120`, 10.x -> `sm100` incl. sm103, else `smXY`;
+without CUDA the `default` bucket applies). Buckets exist exactly where
+FlashInfer publishes arch-specific numbers; otherwise `default` is used.
+The resolved profile and bucket are recorded in `runner_config`
+(`accuracy_profile`, `accuracy_profile_arch`).
+
+| Profile flag | Arch bucket | atol / rtol | max_mismatch_pct | min_cos_sim | max_mean_abs_err | FlashInfer provenance |
+|---|---|---|---:|---:|---:|---|
+| `--bf16-attention` | default | 1e-2 / 1e-2 | - | - | - | bf16 attention close at 1e-2 (trace standards; `test_attention_sink.py`) |
+| `--fp16-attention` | default | 1e-3 / 1e-3 | - | - | - | fp16 attention close at 1e-3 (`test_single_prefill.py`) |
+| `--fp8-attention` | default (SM90) | 1e-2 / 2e-1 | - | - | - | Hopper FP8 KV vs FP16 (`test_fp8_prefill.py`) |
+| `--fp8-attention` | sm100, sm120 | 5e-2 / 5e-2 | 2.0 | - | - | XQA pass ratio >= 0.98 within 0.05/0.05 (`test_xqa.py`, trace standards) |
+| `--nvfp4-attention` | default (SM80/89/90) | 1e-1 / 1e-1 | - | - | - | NVFP4 KV relaxed tolerance (`test_single_prefill.py`, `test_batch_prefill_kernels.py`) |
+| `--nvfp4-attention` | sm100 | 5e-1 / 5e-1 | 10.0 | - | - | trtllm-gen nvfp4 KV + `allowed_mismatch_rate = 0.10` (`test_trtllm_gen_attention_decode.py`) |
+| `--nvfp4-attention` | sm120 | 5e-1 / 5e-1 | 10.0 | 0.94 | 0.09 | SM120 dual criterion: `cos_sim >= 0.94` + `mean_abs_err` thresholds published in 0.02..0.09 per shape (`test_nvfp4_attention_sm120.py`); 0.09 is the loosest bound |
+| `--bf16-gemm` | default | (untouched) | 100.0 | 0.99 | - | `_gemm_check` cosine convention (`flashinfer/trace/templates/gemm.py`) |
+| `--fp8-gemm` | default | (untouched) | 100.0 | 0.99 | - | `test_mm_fp8.py` / `test_bmm_fp8.py`: cos_sim > 0.99 |
+| `--mxfp8-gemm` | default | (untouched) | 100.0 | 0.98 | - | `test_mm_mxfp8.py`: `_MIN_COS_SIM = 0.98` |
+| `--nvfp4-gemm` | default | (untouched) | 100.0 | 0.97 | - | `_fp4_gemm_check` / `test_mm_fp4.py`: cos_sim > 0.97 |
+| `--nvfp4-moe` | default | 0.1 / 0.85 | 8.0 | - | - | FP4 `get_tolerances`: percent 0.92 (`trtllm_gen_fused_moe_utils.py`) |
+| `--mxint4-moe` | default | 0.1 / 0.85 | 7.5 | - | - | MXINT4: percent 0.925 |
+| `--fp8-block-moe` | default | 0.1 / 0.85 | 21.0 | - | - | FP8 block-scale: percent 0.79 |
+| `--fp8-tensor-moe` | default | 0.1 / 0.85 | 8.0 | - | - | FP8 per-tensor: percent 0.92 |
+
+`-` means the knob keeps its flashinfer-mode default (`max_mismatch_pct` 0.0,
+`min_cos_sim` 0.999, `max_mean_abs_err` off). MoE pass percents map to
+mismatch caps as `(1 - percent) * 100`. Profiles that pin atol/rtol disable
+the per-dtype tolerance tiers; GEMM profiles leave atol/rtol untouched (their
+verdict is cosine-only), so tiers stay on and only affect the recorded
+`mismatch_pct` diagnostic.
+
+Note: profiles grade the *outputs* of low-precision kernels (typically
+bf16/fp32). Native packed fp4 output tensors (`torch.float4_e2m1fn_x2`)
+cannot be compared numerically by any mode — PyTorch provides no cast out
+of the packed representation — mirroring FlashInfer, which compares such
+tensors as packed bytes or after dequantization.
 
 ## 5. Advanced Performance Options
 

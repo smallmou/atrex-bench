@@ -882,6 +882,7 @@ def test_invalid_accuracy_mode_is_rejected_by_argparse(
     assert "invalid choice" in capsys.readouterr().err
 
 
+
 def test_build_environment_records_clock_lock_marker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4052,3 +4053,375 @@ def test_build_environment_includes_ptl_state(
     env = run_eval_module._build_environment(clock_locked=True)
     assert "PTL_STATE" in env
     assert env["PTL_STATE"] == "N/A"
+
+
+# ---------------------------------------------------------------------------
+# Kernel accuracy profile flags (per-kernel x per-arch FlashInfer thresholds)
+# ---------------------------------------------------------------------------
+
+_ACCURACY_ENV_VARS = (
+    "ATREX_ACCURACY_MODE",
+    "ATREX_ACCURACY_MAX_MISMATCH_PCT",
+    "ATREX_ACCURACY_MIN_COS_SIM",
+    "ATREX_ACCURACY_MAX_MEAN_ABS_ERR",
+    "ATREX_ACCURACY_DTYPE_TOLERANCES",
+    "ATREX_ACCURACY_PROFILE",
+    "ATREX_ACCURACY_PROFILE_ARCH",
+    "ATREX_CORRECTNESS_MAX_REL_L2",
+)
+
+
+def _clear_accuracy_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Isolate ATREX_ACCURACY_* state around tests that call main().
+
+    Blank values read as "unset" through every configured_* helper. setenv is
+    used instead of delenv because monkeypatch.delenv on an ABSENT variable
+    does not undo values written during the test (pytest 9), while setenv's
+    teardown reliably restores the pre-test state even after main()
+    overwrote the variable.
+    """
+    for name in _ACCURACY_ENV_VARS:
+        monkeypatch.setenv(name, "")
+
+
+def _fake_run_eval_capture(calls: list[dict[str, object]]):
+    def fake_run_eval(**kwargs: object) -> dict[str, object]:
+        calls.append(kwargs)
+        return {
+            "runner_config": {},
+            "passed": {
+                "compile": {"0": {"status": "passed"}},
+                "correctness": {"0": {"status": "passed"}},
+                "performance": {"0": {"status": "skipped"}},
+            },
+            "error": None,
+        }
+
+    return fake_run_eval
+
+
+def _run_main_with_argv(monkeypatch: pytest.MonkeyPatch, extra_argv: list[str]):
+    """Run main() with a faked run_eval; return (exit_code, captured_kwargs)."""
+    from scripts import run_eval as run_eval_module
+
+    _clear_accuracy_env(monkeypatch)
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_eval.py",
+            "--input",
+            "candidate.py",
+            "--reference-dir",
+            "reference",
+            "--output",
+            "output",
+            "--correctness-only",
+            *extra_argv,
+        ],
+    )
+    monkeypatch.setattr(
+        run_eval_module, "run_eval", _fake_run_eval_capture(calls)
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        run_eval_module.main()
+    return exc_info.value.code, calls
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected_env", "expected_kwargs"),
+    [
+        # NVFP4 attention on SM120: trtllm-gen tolerances + SM120 dual
+        # (cosine + mean-abs-err) criterion; profile tolerances disable tiers.
+        (
+            ["--nvfp4-attention", "--accuracy-arch", "sm120"],
+            {
+                "ATREX_ACCURACY_MODE": "flashinfer",
+                "ATREX_ACCURACY_MAX_MISMATCH_PCT": "10.0",
+                "ATREX_ACCURACY_MIN_COS_SIM": "0.94",
+                "ATREX_ACCURACY_MAX_MEAN_ABS_ERR": "0.09",
+                "ATREX_ACCURACY_DTYPE_TOLERANCES": "0",
+                "ATREX_ACCURACY_PROFILE": "nvfp4_attention",
+                "ATREX_ACCURACY_PROFILE_ARCH": "sm120",
+            },
+            {"atol": 0.5, "rtol": 0.5},
+        ),
+        # NVFP4 attention on SM90 (fa2-class): strict 1e-1/1e-1, no
+        # mismatch/cosine/MAE overrides published for that bucket.
+        (
+            ["--nvfp4-attention", "--accuracy-arch", "sm90"],
+            {
+                "ATREX_ACCURACY_MODE": "flashinfer",
+                "ATREX_ACCURACY_DTYPE_TOLERANCES": "0",
+                "ATREX_ACCURACY_PROFILE": "nvfp4_attention",
+                "ATREX_ACCURACY_PROFILE_ARCH": "default",
+                "ATREX_ACCURACY_MAX_MISMATCH_PCT": "",
+                "ATREX_ACCURACY_MIN_COS_SIM": "",
+                "ATREX_ACCURACY_MAX_MEAN_ABS_ERR": "",
+            },
+            {"atol": 0.1, "rtol": 0.1},
+        ),
+        # FP8 attention on SM100+: XQA pass-ratio convention.
+        (
+            ["--fp8-attention", "--accuracy-arch", "sm100"],
+            {
+                "ATREX_ACCURACY_MODE": "flashinfer",
+                "ATREX_ACCURACY_MAX_MISMATCH_PCT": "2.0",
+                "ATREX_ACCURACY_PROFILE_ARCH": "sm100",
+            },
+            {"atol": 0.05, "rtol": 0.05},
+        ),
+        # NVFP4 GEMM: cosine-only convention; atol/rtol untouched so the
+        # per-dtype tiers stay on (they only feed the mismatch diagnostic).
+        (
+            ["--nvfp4-gemm"],
+            {
+                "ATREX_ACCURACY_MODE": "flashinfer",
+                "ATREX_ACCURACY_MAX_MISMATCH_PCT": "100.0",
+                "ATREX_ACCURACY_MIN_COS_SIM": "0.97",
+                "ATREX_ACCURACY_DTYPE_TOLERANCES": "1",
+                "ATREX_ACCURACY_PROFILE": "nvfp4_gemm",
+                "ATREX_ACCURACY_PROFILE_ARCH": "default",
+            },
+            {"atol": 1e-2, "rtol": 0.05},
+        ),
+        # MoE: FP4 percent 0.92 -> mismatch cap 8.0 at atol 0.1/rtol 0.85.
+        (
+            ["--nvfp4-moe"],
+            {
+                "ATREX_ACCURACY_MODE": "flashinfer",
+                "ATREX_ACCURACY_MAX_MISMATCH_PCT": "8.0",
+                "ATREX_ACCURACY_DTYPE_TOLERANCES": "0",
+            },
+            {"atol": 0.1, "rtol": 0.85},
+        ),
+    ],
+)
+def test_accuracy_profile_flags_expand_flashinfer_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    argv: list[str],
+    expected_env: dict[str, str],
+    expected_kwargs: dict[str, float],
+) -> None:
+    import os
+
+    code, calls = _run_main_with_argv(monkeypatch, argv)
+
+    assert code == 0
+    for key, value in expected_kwargs.items():
+        assert calls[0][key] == value
+    for key, value in expected_env.items():
+        assert os.environ.get(key, "") == value, key
+
+
+def test_accuracy_profile_explicit_knobs_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import os
+
+    code, calls = _run_main_with_argv(
+        monkeypatch,
+        [
+            "--nvfp4-attention",
+            "--accuracy-arch",
+            "sm120",
+            "--atol",
+            "0.25",
+            "--accuracy-min-cos-sim",
+            "0.9",
+        ],
+    )
+
+    assert code == 0
+    assert calls[0]["atol"] == 0.25  # explicit beats the profile's 0.5
+    assert calls[0]["rtol"] == 0.5  # profile fills the untouched knob
+    assert os.environ["ATREX_ACCURACY_MIN_COS_SIM"] == "0.9"
+    assert os.environ["ATREX_ACCURACY_MAX_MISMATCH_PCT"] == "10.0"
+    assert os.environ["ATREX_ACCURACY_MAX_MEAN_ABS_ERR"] == "0.09"
+
+
+def test_accuracy_profile_flags_are_mutually_exclusive(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from scripts import run_eval as run_eval_module
+
+    _clear_accuracy_env(monkeypatch)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["run_eval.py", "--reference-dir", "reference", "--nvfp4-gemm", "--bf16-gemm"],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        run_eval_module.main()
+
+    assert exc_info.value.code == 2
+    assert "not allowed with argument" in capsys.readouterr().err
+
+
+def test_accuracy_profile_conflicts_with_allclose_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import run_eval as run_eval_module
+
+    _clear_accuracy_env(monkeypatch)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_eval.py",
+            "--reference-dir",
+            "reference",
+            "--accuracy-mode",
+            "allclose",
+            "--nvfp4-gemm",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        run_eval_module.main()
+
+    assert "cannot be combined" in str(exc_info.value)
+
+
+def test_accuracy_profile_conflicts_with_max_rel_l2(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import run_eval as run_eval_module
+
+    _clear_accuracy_env(monkeypatch)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_eval.py",
+            "--reference-dir",
+            "reference",
+            "--nvfp4-attention",
+            "--correctness-max-rel-l2",
+            "0.1",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        run_eval_module.main()
+
+    assert "cannot be combined" in str(exc_info.value)
+
+
+def test_config_profile_boolean_expands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import os
+
+    from scripts import run_eval as run_eval_module
+
+    _clear_accuracy_env(monkeypatch)
+    config_path = tmp_path / "runner.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "input": "candidate.py",
+                "reference_dir": "reference",
+                "output": "output",
+                "validation_mode": "correctness_only",
+                "nvfp4_gemm": True,
+                "accuracy_arch": "sm100",
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        sys, "argv", ["run_eval.py", "--config", str(config_path)]
+    )
+    monkeypatch.setattr(
+        run_eval_module, "run_eval", _fake_run_eval_capture(calls)
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        run_eval_module.main()
+
+    assert exc_info.value.code == 0
+    assert os.environ["ATREX_ACCURACY_PROFILE"] == "nvfp4_gemm"
+    # nvfp4_gemm publishes no arch-specific bucket: sm100 resolves to default.
+    assert os.environ["ATREX_ACCURACY_PROFILE_ARCH"] == "default"
+    assert os.environ["ATREX_ACCURACY_MIN_COS_SIM"] == "0.97"
+
+
+def test_config_multiple_profiles_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import run_eval as run_eval_module
+
+    _clear_accuracy_env(monkeypatch)
+    config_path = tmp_path / "runner.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "reference_dir": "reference",
+                "nvfp4_gemm": True,
+                "bf16_attention": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        sys, "argv", ["run_eval.py", "--config", str(config_path)]
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        run_eval_module.main()
+
+    assert "multiple kernel accuracy profiles" in str(exc_info.value)
+
+
+def test_invalid_accuracy_arch_via_config_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import run_eval as run_eval_module
+
+    _clear_accuracy_env(monkeypatch)
+    config_path = tmp_path / "runner.json"
+    config_path.write_text(
+        json.dumps({"reference_dir": "reference", "accuracy_arch": "tpu"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        sys, "argv", ["run_eval.py", "--config", str(config_path)]
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        run_eval_module.main()
+
+    assert "accuracy_arch must be one of" in str(exc_info.value)
+
+
+def test_runner_config_records_accuracy_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import run_eval as run_eval_module
+
+    monkeypatch.setenv("ATREX_ACCURACY_MODE", "flashinfer")
+    monkeypatch.setenv("ATREX_ACCURACY_PROFILE", "nvfp4_attention")
+    monkeypatch.setenv("ATREX_ACCURACY_PROFILE_ARCH", "sm120")
+    monkeypatch.setenv("ATREX_ACCURACY_MAX_MEAN_ABS_ERR", "0.09")
+
+    config = run_eval_module._build_runner_config(
+        config_version="v1",
+        mode="candidate",
+        atol=1e-2,
+        rtol=0.05,
+        num_correctness_cases=1,
+        warmup_iters=25,
+        bench_iters=50,
+    )
+
+    assert config["accuracy_profile"] == "nvfp4_attention"
+    assert config["accuracy_profile_arch"] == "sm120"
+    assert config["accuracy_max_mean_abs_err"] == 0.09

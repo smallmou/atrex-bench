@@ -57,7 +57,10 @@ CORRECTNESS_MAX_REL_L2_ENV = "ATREX_CORRECTNESS_MAX_REL_L2"
 ACCURACY_MODE_ENV = "ATREX_ACCURACY_MODE"
 ACCURACY_MAX_MISMATCH_PCT_ENV = "ATREX_ACCURACY_MAX_MISMATCH_PCT"
 ACCURACY_MIN_COS_SIM_ENV = "ATREX_ACCURACY_MIN_COS_SIM"
+ACCURACY_MAX_MEAN_ABS_ERR_ENV = "ATREX_ACCURACY_MAX_MEAN_ABS_ERR"
 ACCURACY_DTYPE_TOLERANCES_ENV = "ATREX_ACCURACY_DTYPE_TOLERANCES"
+ACCURACY_PROFILE_ENV = "ATREX_ACCURACY_PROFILE"
+ACCURACY_PROFILE_ARCH_ENV = "ATREX_ACCURACY_PROFILE_ARCH"
 
 ACCURACY_MODE_ALLCLOSE = "allclose"
 ACCURACY_MODE_FLASHINFER = "flashinfer"
@@ -65,6 +68,150 @@ ACCURACY_MODES = (ACCURACY_MODE_ALLCLOSE, ACCURACY_MODE_FLASHINFER)
 
 # flashinfer default_check's signature default: min_cos_sim = 1.0 - 1e-3.
 FLASHINFER_DEFAULT_MIN_COS_SIM = 1.0 - 1e-3
+
+
+@dataclass(frozen=True)
+class AccuracyProfile:
+    """One kernel-class x hardware threshold bundle in flashinfer mode.
+
+    Field semantics match the flashinfer-mode knobs; None leaves the knob at
+    its engine default. ``atol``/``rtol``, when set, act as explicit
+    tolerances (they disable the per-dtype tiers).
+    """
+
+    atol: float | None = None
+    rtol: float | None = None
+    max_mismatch_pct: float | None = None
+    min_cos_sim: float | None = None
+    max_mean_abs_err: float | None = None
+
+
+# Per-kernel accuracy profiles, one CLI flag each. Every number is transcribed
+# from the FlashInfer test that publishes it (flashinfer-ai/flashinfer,
+# Apache-2.0); provenance per entry. ``default`` is the fallback bucket when
+# the running GPU has no arch-specific variant. Arch buckets follow FlashInfer's
+# own backend split: fa2-class criteria on SM80/89/90, trtllm-gen/XQA-class on
+# SM100+, plus the SM120-specific dual (cosine + mean-abs-err) criterion.
+#
+# MoE note: FlashInfer's fused-MoE harness grades with isclose(atol, rtol) at a
+# required PASS PERCENT (tests/moe/trtllm_gen_fused_moe_utils.py
+# ::get_tolerances); the percent maps to our mismatch cap as
+# max_mismatch_pct = (1 - percent) * 100.
+KERNEL_ACCURACY_PROFILES: dict[str, dict[str, AccuracyProfile]] = {
+    # --- attention -------------------------------------------------------
+    "bf16_attention": {
+        # bf16 attention output close at 1e-2/1e-2 (trace reference
+        # correctness standards; test_attention_sink.py et al.).
+        "default": AccuracyProfile(atol=1e-2, rtol=1e-2),
+    },
+    "fp16_attention": {
+        # fp16 attention output close at 1e-3/1e-3 (test_single_prefill.py).
+        "default": AccuracyProfile(atol=1e-3, rtol=1e-3),
+    },
+    "fp8_attention": {
+        # Hopper FP8 KV vs FP16: atol=1e-2, rtol=2e-1 (test_fp8_prefill.py).
+        "default": AccuracyProfile(atol=1e-2, rtol=2e-1),
+        # XQA convention on SM100+: pass ratio >= 0.98 within atol/rtol 0.05
+        # (test_xqa.py; trace standards "XQA pass ratio >=0.98").
+        "sm100": AccuracyProfile(atol=5e-2, rtol=5e-2, max_mismatch_pct=2.0),
+        "sm120": AccuracyProfile(atol=5e-2, rtol=5e-2, max_mismatch_pct=2.0),
+    },
+    "nvfp4_attention": {
+        # NVFP4 KV on fa2-class backends: rtol/atol 1e-1
+        # (test_single_prefill.py "NVFP4 is 4-bit; use relaxed tolerance",
+        # test_batch_prefill_kernels.py).
+        "default": AccuracyProfile(atol=1e-1, rtol=1e-1),
+        # trtllm-gen on SM100+: nvfp4 KV rtol/atol 5e-1 +
+        # allowed_mismatch_rate 0.10 (test_trtllm_gen_attention_decode.py).
+        "sm100": AccuracyProfile(atol=5e-1, rtol=5e-1, max_mismatch_pct=10.0),
+        # SM120 additionally: cos_sim >= 0.94 (test_nvfp4_attention_sm120.py)
+        # and mean_abs_err <= per-shape thresholds published in 0.02..0.09;
+        # 0.09 is the loosest published bound.
+        "sm120": AccuracyProfile(
+            atol=5e-1,
+            rtol=5e-1,
+            max_mismatch_pct=10.0,
+            min_cos_sim=0.94,
+            max_mean_abs_err=0.09,
+        ),
+    },
+    # --- GEMM (FlashInfer's cosine-only convention: elementwise disabled
+    # via max_mismatch_pct=100, verdict from the cosine floor;
+    # flashinfer/trace/templates/gemm.py _*_gemm_check) --------------------
+    "bf16_gemm": {
+        # _gemm_check: cos_sim > 0.99 ("bf16 K-accumulation makes
+        # element-wise tolerance unreliable; cosine is the repo convention").
+        "default": AccuracyProfile(max_mismatch_pct=100.0, min_cos_sim=0.99),
+    },
+    "fp8_gemm": {
+        # test_mm_fp8.py / test_bmm_fp8.py: cos_sim > 0.99.
+        "default": AccuracyProfile(max_mismatch_pct=100.0, min_cos_sim=0.99),
+    },
+    "mxfp8_gemm": {
+        # test_mm_mxfp8.py: _MIN_COS_SIM = 0.98.
+        "default": AccuracyProfile(max_mismatch_pct=100.0, min_cos_sim=0.98),
+    },
+    "nvfp4_gemm": {
+        # _fp4_gemm_check / test_mm_fp4.py: cos_sim > 0.97.
+        "default": AccuracyProfile(max_mismatch_pct=100.0, min_cos_sim=0.97),
+    },
+    # --- fused MoE (atol 0.1 / rtol 0.85 + pass percent;
+    # trtllm_gen_fused_moe_utils.py::get_tolerances) ------------------------
+    "nvfp4_moe": {
+        # FP4: {"atol": 0.1, "rtol": 0.85, "percent": 0.92}.
+        "default": AccuracyProfile(atol=0.1, rtol=0.85, max_mismatch_pct=8.0),
+    },
+    "mxint4_moe": {
+        # MXINT4: {"atol": 0.1, "rtol": 0.85, "percent": 0.925}.
+        "default": AccuracyProfile(atol=0.1, rtol=0.85, max_mismatch_pct=7.5),
+    },
+    "fp8_block_moe": {
+        # FP8 block-scale: {"atol": 0.1, "rtol": 0.85, "percent": 0.79}.
+        "default": AccuracyProfile(atol=0.1, rtol=0.85, max_mismatch_pct=21.0),
+    },
+    "fp8_tensor_moe": {
+        # FP8 per-tensor: {"atol": 0.1, "rtol": 0.85, "percent": 0.92}.
+        "default": AccuracyProfile(atol=0.1, rtol=0.85, max_mismatch_pct=8.0),
+    },
+}
+
+ACCURACY_PROFILE_NAMES = tuple(sorted(KERNEL_ACCURACY_PROFILES))
+ACCURACY_ARCH_CHOICES = ("auto", "sm80", "sm89", "sm90", "sm100", "sm120")
+
+
+def accuracy_arch_from_capability(capability: tuple[int, int] | None) -> str:
+    """Map a CUDA compute capability to a profile arch bucket name.
+
+    SM103 falls into the SM100 bucket (FlashInfer groups Blackwell
+    datacenter parts together); anything without a specific bucket resolves
+    to "default" at lookup time, so this returns the canonical smXY name.
+    """
+    if capability is None:
+        return "default"
+    major, minor = capability
+    if major == 12:
+        return "sm120"
+    if major == 10:
+        return "sm100"
+    return f"sm{major}{minor}"
+
+
+def resolve_accuracy_profile(
+    profile_name: str, arch: str
+) -> tuple[AccuracyProfile, str]:
+    """Pick the arch bucket for a profile: exact arch, else default.
+
+    Returns the profile and the bucket key actually used ("default" when the
+    arch has no specific variant), so the resolved choice is auditable.
+    """
+    if profile_name not in KERNEL_ACCURACY_PROFILES:
+        raise ValueError(
+            f"unknown accuracy profile {profile_name!r}; "
+            f"expected one of {list(ACCURACY_PROFILE_NAMES)}"
+        )
+    table = KERNEL_ACCURACY_PROFILES[profile_name]
+    bucket = arch if arch in table else "default"
+    return table[bucket], bucket
 
 
 @dataclass(frozen=True)
@@ -77,10 +224,12 @@ class OutputDiff:
     not recorded — they are derivable from metadata.json.output_dtypes and
     do not have a real consumer.
 
-    ``mismatch_pct`` / ``cos_sim`` are additive diagnostics recorded only in
-    ``accuracy_mode=flashinfer`` (None otherwise): the percentage of elements
-    failing the elementwise isclose criterion, and the non-finite-filtered
-    cosine similarity against the reference.
+    ``mismatch_pct`` / ``cos_sim`` / ``mean_abs_err`` are additive diagnostics
+    recorded only in ``accuracy_mode=flashinfer`` (None otherwise): the
+    percentage of elements failing the elementwise isclose criterion, the
+    non-finite-filtered cosine similarity against the reference, and the mean
+    elementwise absolute difference (FlashInfer's SM120 NVFP4-attention
+    criterion grades this against a per-shape threshold).
     """
 
     name: str
@@ -90,6 +239,7 @@ class OutputDiff:
     relative_l2: float | None = None
     mismatch_pct: float | None = None
     cos_sim: float | None = None
+    mean_abs_err: float | None = None
     error: str | None = None
 
 
@@ -357,6 +507,24 @@ def effective_accuracy_min_cos_sim(
     return configured
 
 
+def configured_accuracy_max_mean_abs_err(explicit: float | None = None) -> float | None:
+    """Resolve the mean-abs-err ceiling, or None when the criterion is off.
+
+    FlashInfer's SM120 NVFP4-attention tests grade mean absolute error
+    against per-shape thresholds; kernel profiles carry the published bound.
+    """
+    if explicit is not None:
+        value = float(explicit)
+    else:
+        raw = os.environ.get(ACCURACY_MAX_MEAN_ABS_ERR_ENV)
+        if raw is None or not raw.strip():
+            return None
+        value = float(raw)
+    if value < 0:
+        raise ValueError("accuracy max_mean_abs_err must be non-negative")
+    return value
+
+
 def configured_accuracy_dtype_tolerances(explicit: bool | None = None) -> bool:
     """Whether flashinfer mode should use per-dtype tiers instead of atol/rtol.
 
@@ -371,6 +539,37 @@ def configured_accuracy_dtype_tolerances(explicit: bool | None = None) -> bool:
     return raw is not None and raw.strip() == "1"
 
 
+def configured_accuracy_profile(explicit: str | None = None) -> str | None:
+    """Resolve the kernel-profile name: explicit arg > env > None.
+
+    Profiles are expanded by ``run_eval.main()`` into the flashinfer-mode
+    knobs; the engine itself only ever sees expanded values. The env value
+    exists for audit — worker subprocesses inherit it and
+    ``_build_runner_config`` records it in eval_result.json.
+    """
+    if explicit is not None:
+        profile = str(explicit)
+    else:
+        raw = os.environ.get(ACCURACY_PROFILE_ENV)
+        profile = raw.strip() if raw is not None and raw.strip() else None
+    if profile is None:
+        return None
+    if profile not in KERNEL_ACCURACY_PROFILES:
+        raise ValueError(
+            f"unknown accuracy profile {profile!r}; "
+            f"expected one of {list(ACCURACY_PROFILE_NAMES)}"
+        )
+    return profile
+
+
+def configured_accuracy_profile_arch(explicit: str | None = None) -> str | None:
+    """Resolve the arch bucket used for profile expansion (audit only)."""
+    if explicit is not None:
+        return str(explicit)
+    raw = os.environ.get(ACCURACY_PROFILE_ARCH_ENV)
+    return raw.strip() if raw is not None and raw.strip() else None
+
+
 def _compare_output_tensors(
     reference_tensor: torch.Tensor,
     candidate_tensor: torch.Tensor,
@@ -383,6 +582,7 @@ def _compare_output_tensors(
     accuracy_mode: str = ACCURACY_MODE_ALLCLOSE,
     max_mismatch_pct: float = 0.0,
     min_cos_sim: float | None = None,
+    max_mean_abs_err: float | None = None,
     dtype_tolerances: bool = False,
 ) -> OutputDiff:
     """Compare a pair of output tensors and return the per-output diff record.
@@ -390,12 +590,15 @@ def _compare_output_tensors(
     ``accuracy_mode=flashinfer`` replaces the single-criterion verdict with
     FlashInfer's ``default_check`` semantics: the elementwise isclose
     mismatch PERCENTAGE must not exceed ``max_mismatch_pct`` AND (when set)
-    the cosine similarity must reach ``min_cos_sim``. With
-    ``dtype_tolerances=True`` the isclose rtol/atol come from
+    the cosine similarity must reach ``min_cos_sim`` AND (when set) the mean
+    elementwise absolute error must stay within ``max_mean_abs_err`` (the
+    dual cosine+MAE criterion of FlashInfer's SM120 NVFP4-attention tests).
+    With ``dtype_tolerances=True`` the isclose rtol/atol come from
     ``flashinfer_default_tolerances`` on the candidate dtype (reference dtype
     when the candidate is non-float) instead of the global atol/rtol. The
     diagnostic metrics (max abs/rel diff, relative_l2) are recorded in every
-    mode; ``mismatch_pct``/``cos_sim`` only in flashinfer mode.
+    mode; ``mismatch_pct``/``cos_sim``/``mean_abs_err`` only in flashinfer
+    mode.
     """
     if strict_dtype and reference_tensor.dtype != candidate_tensor.dtype:
         return OutputDiff(
@@ -449,10 +652,13 @@ def _compare_output_tensors(
         relative_l2 = float((diff_l2 / reference_norm.clamp_min(1e-12)).item())
         mismatch_pct: float | None = None
         cos_sim: float | None = None
+        mean_abs_err: float | None = None
         if accuracy_mode == ACCURACY_MODE_FLASHINFER:
             # FlashInfer default_check semantics, in this module's float64
             # comparison space: criterion 1 caps the fraction of elements
-            # failing isclose; criterion 2 floors the flattened cosine.
+            # failing isclose; criterion 2 floors the flattened cosine;
+            # criterion 3 caps the mean absolute error (SM120 NVFP4
+            # attention convention).
             if dtype_tolerances:
                 tier_dtype = (
                     candidate_tensor.dtype
@@ -475,8 +681,13 @@ def _compare_output_tensors(
             else:
                 mismatch_pct = 0.0
             cos_sim = _cosine_similarity(candidate_tensor, reference_tensor)
-            passed = mismatch_pct <= max_mismatch_pct and (
-                min_cos_sim is None or cos_sim >= min_cos_sim
+            mean_abs_err = (
+                float(abs_diff.mean().item()) if abs_diff.numel() else 0.0
+            )
+            passed = (
+                mismatch_pct <= max_mismatch_pct
+                and (min_cos_sim is None or cos_sim >= min_cos_sim)
+                and (max_mean_abs_err is None or mean_abs_err <= max_mean_abs_err)
             )
         elif max_rel_l2 is not None:
             passed = relative_l2 <= max_rel_l2
@@ -498,6 +709,7 @@ def _compare_output_tensors(
         relative_l2 = None
         mismatch_pct = None
         cos_sim = None
+        mean_abs_err = None
 
     return OutputDiff(
         name=name,
@@ -507,6 +719,7 @@ def _compare_output_tensors(
         relative_l2=relative_l2,
         mismatch_pct=mismatch_pct,
         cos_sim=cos_sim,
+        mean_abs_err=mean_abs_err,
         error=error,
     )
 
@@ -526,6 +739,7 @@ def _compare_value_trees(
     accuracy_mode=ACCURACY_MODE_ALLCLOSE,
     max_mismatch_pct=0.0,
     min_cos_sim=None,
+    max_mean_abs_err=None,
     dtype_tolerances=False,
 ):
     """Compare return values, with exact types for explicit mutation contracts."""
@@ -554,6 +768,7 @@ def _compare_value_trees(
                 accuracy_mode=accuracy_mode,
                 max_mismatch_pct=max_mismatch_pct,
                 min_cos_sim=min_cos_sim,
+                max_mean_abs_err=max_mean_abs_err,
                 dtype_tolerances=dtype_tolerances,
             )
         ]
@@ -575,6 +790,7 @@ def _compare_value_trees(
                 accuracy_mode=accuracy_mode,
                 max_mismatch_pct=max_mismatch_pct,
                 min_cos_sim=min_cos_sim,
+                max_mean_abs_err=max_mean_abs_err,
                 dtype_tolerances=dtype_tolerances,
             )
         ]
@@ -599,6 +815,7 @@ def _compare_value_trees(
             accuracy_mode=accuracy_mode,
             max_mismatch_pct=max_mismatch_pct,
             min_cos_sim=min_cos_sim,
+            max_mean_abs_err=max_mean_abs_err,
             # A metadata-owned per-path tolerance is explicit by definition:
             # it wins over the flashinfer per-dtype tiers.
             dtype_tolerances=dtype_tolerances and tolerance is None,
@@ -752,6 +969,7 @@ def check_correctness(
     accuracy_mode: str | None = None,
     accuracy_max_mismatch_pct: float | None = None,
     accuracy_min_cos_sim: float | None = None,
+    accuracy_max_mean_abs_err: float | None = None,
     accuracy_dtype_tolerances: bool | None = None,
 ) -> CorrectnessShapeResult:
     """Compare candidate outputs against the eager reference baseline for one shape.
@@ -786,6 +1004,9 @@ def check_correctness(
         )
         effective_min_cos_sim = effective_accuracy_min_cos_sim(
             effective_accuracy_mode, accuracy_min_cos_sim
+        )
+        effective_max_mean_abs_err = configured_accuracy_max_mean_abs_err(
+            accuracy_max_mean_abs_err
         )
         effective_dtype_tolerances = configured_accuracy_dtype_tolerances(
             accuracy_dtype_tolerances
@@ -977,6 +1198,7 @@ def check_correctness(
                 accuracy_mode=effective_accuracy_mode,
                 max_mismatch_pct=effective_max_mismatch_pct,
                 min_cos_sim=effective_min_cos_sim,
+                max_mean_abs_err=effective_max_mean_abs_err,
                 dtype_tolerances=effective_dtype_tolerances,
             )
             output_diffs = [
@@ -1003,6 +1225,7 @@ def check_correctness(
                             accuracy_mode=effective_accuracy_mode,
                             max_mismatch_pct=effective_max_mismatch_pct,
                             min_cos_sim=effective_min_cos_sim,
+                            max_mean_abs_err=effective_max_mean_abs_err,
                             dtype_tolerances=effective_dtype_tolerances,
                         )
                     )

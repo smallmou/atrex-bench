@@ -848,3 +848,41 @@ def test_allclose_mode_leaves_flashinfer_diagnostics_unset(tmp_path: Path) -> No
     for diff in result.cases[0].outputs:
         assert diff.mismatch_pct is None
         assert diff.cos_sim is None
+
+
+def test_flashinfer_max_mean_abs_err_criterion(tmp_path: Path) -> None:
+    """SM120 NVFP4-attention style: MAE ceiling as an independent criterion."""
+    reference_path, candidate_path = _write_pair(
+        tmp_path, ref_forward="x", cand_forward="x * 1.2", inputs="torch.ones(10, 100)"
+    )
+    # Uniform 20% overshoot: cos == 1.0 and (with cap 100) mismatch passes,
+    # so only the MAE ceiling can fail this candidate (mean |diff| = 0.2).
+    failing = check_correctness(
+        reference_path,
+        candidate_path,
+        device="cpu",
+        accuracy_mode=ACCURACY_MODE_FLASHINFER,
+        accuracy_max_mismatch_pct=100.0,
+        accuracy_min_cos_sim=0.99,
+        accuracy_max_mean_abs_err=0.1,
+    )
+    assert failing.status == "failed"
+    diff = failing.cases[0].outputs[0]
+    assert diff.mean_abs_err == pytest.approx(0.2)
+
+    passing = check_correctness(
+        reference_path,
+        candidate_path,
+        device="cpu",
+        accuracy_mode=ACCURACY_MODE_FLASHINFER,
+        accuracy_max_mismatch_pct=100.0,
+        accuracy_min_cos_sim=0.99,
+        accuracy_max_mean_abs_err=0.3,
+    )
+    assert passing.status == "passed"
+
+
+def test_mean_abs_err_unset_in_allclose_mode(tmp_path: Path) -> None:
+    result = check_correctness(REFERENCE_PATH, CANDIDATE_PATH, device="cpu")
+    assert result.status == "passed"
+    assert result.cases[0].outputs[0].mean_abs_err is None

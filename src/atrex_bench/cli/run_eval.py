@@ -62,21 +62,31 @@ from atrex_bench.eval.clock_lock import (
 )
 from atrex_bench.eval.clock_monitor import NvidiaClockMonitor
 from atrex_bench.eval.correctness import (
+    ACCURACY_ARCH_CHOICES,
     ACCURACY_DTYPE_TOLERANCES_ENV,
+    ACCURACY_MAX_MEAN_ABS_ERR_ENV,
     ACCURACY_MAX_MISMATCH_PCT_ENV,
     ACCURACY_MIN_COS_SIM_ENV,
     ACCURACY_MODE_ENV,
     ACCURACY_MODE_FLASHINFER,
     ACCURACY_MODES,
+    ACCURACY_PROFILE_ARCH_ENV,
+    ACCURACY_PROFILE_ENV,
+    ACCURACY_PROFILE_NAMES,
     CORRECTNESS_MAX_REL_L2_ENV,
+    accuracy_arch_from_capability,
     configured_accuracy_dtype_tolerances,
+    configured_accuracy_max_mean_abs_err,
     configured_accuracy_max_mismatch_pct,
     configured_accuracy_min_cos_sim,
     configured_accuracy_mode,
+    configured_accuracy_profile,
+    configured_accuracy_profile_arch,
     configured_max_rel_l2,
     effective_accuracy_min_cos_sim,
     load_minimum_correctness_cases,
     metadata_owns_correctness,
+    resolve_accuracy_profile,
 )
 from atrex_bench.eval.nvidia_clock import NvidiaSmi
 from atrex_bench.eval.reward_hack import (
@@ -150,6 +160,9 @@ _RUNNER_CONFIG_KEYS = frozenset(
         "accuracy_mode",
         "accuracy_max_mismatch_pct",
         "accuracy_min_cos_sim",
+        "accuracy_max_mean_abs_err",
+        "accuracy_arch",
+        *ACCURACY_PROFILE_NAMES,
         "num_correctness_cases",
         "warmup_iters",
         "bench_iters",
@@ -1215,6 +1228,9 @@ def _build_runner_config(
         "rtol": rtol,
         "correctness_max_rel_l2": configured_max_rel_l2(),
         "accuracy_mode": configured_accuracy_mode(),
+        "accuracy_profile": configured_accuracy_profile(),
+        "accuracy_profile_arch": configured_accuracy_profile_arch(),
+        "accuracy_max_mean_abs_err": configured_accuracy_max_mean_abs_err(),
         "accuracy_max_mismatch_pct": configured_accuracy_max_mismatch_pct(),
         "accuracy_min_cos_sim": effective_accuracy_min_cos_sim(
             configured_accuracy_mode()
@@ -4241,6 +4257,25 @@ def _payload_overall_passed(payload: dict[str, object]) -> bool:
     return False
 
 
+def _detect_accuracy_arch() -> str:
+    """Best-effort compute-capability bucket for kernel accuracy profiles.
+
+    torch is already imported in this process (atrex_bench.eval pulls it in),
+    but CUDA may be absent (CPU-only CI): fall back to the profile tables'
+    "default" bucket, which carries FlashInfer's arch-agnostic criteria.
+    """
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return accuracy_arch_from_capability(
+                torch.cuda.get_device_capability()
+            )
+    except Exception:
+        pass
+    return "default"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Run compile/correctness/performance evaluation across all shapes"
@@ -4354,6 +4389,49 @@ def main() -> None:
             "convention is 0.99). A value <= -1.0 disables the criterion."
         ),
     )
+    parser.add_argument(
+        "--accuracy-max-mean-abs-err",
+        type=float,
+        default=None,
+        help=(
+            "flashinfer accuracy mode only: ceiling on the mean elementwise "
+            "absolute error (FlashInfer's SM120 NVFP4-attention criterion). "
+            "Unset disables the criterion; kernel profile flags carry their "
+            "published bound."
+        ),
+    )
+    parser.add_argument(
+        "--accuracy-arch",
+        type=str,
+        default=None,
+        choices=list(ACCURACY_ARCH_CHOICES),
+        help=(
+            "Hardware bucket for kernel accuracy profile flags. 'auto' "
+            "(default) detects the CUDA compute capability: 12.x -> sm120, "
+            "10.x -> sm100 (incl. sm103), otherwise smXY; without CUDA the "
+            "'default' bucket applies. Profiles use their arch-specific "
+            "FlashInfer thresholds when published, else the default bucket."
+        ),
+    )
+    # Per-kernel accuracy profile flags (mutually exclusive). Each applies
+    # FlashInfer's published criteria for that kernel class, selected by
+    # --accuracy-arch; see docs/run_eval_cli_contract.md Section 4.2 for the
+    # full threshold table and per-number provenance.
+    accuracy_profile_group = parser.add_mutually_exclusive_group()
+    for _profile_name in ACCURACY_PROFILE_NAMES:
+        accuracy_profile_group.add_argument(
+            f"--{_profile_name.replace('_', '-')}",
+            action="store_true",
+            dest=_profile_name,
+            default=False,
+            help=(
+                f"Apply FlashInfer's {_profile_name} accuracy criteria "
+                "(implies --accuracy-mode flashinfer; thresholds vary by "
+                "--accuracy-arch where FlashInfer publishes arch-specific "
+                "numbers). Explicit --atol/--rtol/--accuracy-* values "
+                "override the profile."
+            ),
+        )
     parser.add_argument(
         "--num-correctness-cases",
         type=int,
@@ -4763,6 +4841,10 @@ def main() -> None:
         args.accuracy_min_cos_sim is not None
         or "accuracy_min_cos_sim" in runner_file_config
     )
+    accuracy_mae_explicit = (
+        args.accuracy_max_mean_abs_err is not None
+        or "accuracy_max_mean_abs_err" in runner_file_config
+    )
     # Resolve through configured_accuracy_mode so the precedence is
     # CLI > config > ATREX_ACCURACY_MODE env > allclose, matching how
     # correctness_max_rel_l2 treats its env channel.
@@ -4784,6 +4866,12 @@ def main() -> None:
         config=runner_file_config,
         default=None,
     )
+    args.accuracy_max_mean_abs_err = _resolve_runner_option(
+        "accuracy_max_mean_abs_err",
+        cli_value=args.accuracy_max_mean_abs_err,
+        config=runner_file_config,
+        default=None,
+    )
     try:
         # resolved_accuracy_mode is CLI>config or None; configured_accuracy_mode
         # then falls back to ATREX_ACCURACY_MODE (inherited by worker
@@ -4795,8 +4883,83 @@ def main() -> None:
         args.accuracy_min_cos_sim = configured_accuracy_min_cos_sim(
             args.accuracy_min_cos_sim
         )
+        args.accuracy_max_mean_abs_err = configured_accuracy_max_mean_abs_err(
+            args.accuracy_max_mean_abs_err
+        )
     except (TypeError, ValueError) as error:
         raise SystemExit(str(error)) from error
+    # Expand a kernel accuracy profile into the flashinfer-mode knobs.
+    # Precedence per knob: explicit CLI/config value > profile > built-in
+    # default. A profile flag implies accuracy_mode=flashinfer; combining it
+    # with an explicit allclose mode is a contradiction and rejected. The
+    # profile selection is CLI-flag > config-boolean (at most one per
+    # source); the arch bucket is --accuracy-arch or auto-detected.
+    cli_accuracy_profile = next(
+        (name for name in ACCURACY_PROFILE_NAMES if getattr(args, name, False)),
+        None,
+    )
+    config_accuracy_profiles = [
+        name
+        for name in ACCURACY_PROFILE_NAMES
+        if _runner_config_boolean(name, runner_file_config)
+    ]
+    if len(config_accuracy_profiles) > 1:
+        raise SystemExit(
+            "config enables multiple kernel accuracy profiles: "
+            + ", ".join(config_accuracy_profiles)
+        )
+    resolved_accuracy_profile = cli_accuracy_profile or (
+        config_accuracy_profiles[0] if config_accuracy_profiles else None
+    )
+    resolved_accuracy_arch = str(
+        _resolve_runner_option(
+            "accuracy_arch",
+            cli_value=args.accuracy_arch,
+            config=runner_file_config,
+            default="auto",
+        )
+    )
+    if resolved_accuracy_arch not in ACCURACY_ARCH_CHOICES:
+        raise SystemExit(
+            f"accuracy_arch must be one of {list(ACCURACY_ARCH_CHOICES)}"
+        )
+    resolved_profile_bucket: str | None = None
+    if resolved_accuracy_profile is not None:
+        if accuracy_mode_explicit and args.accuracy_mode != ACCURACY_MODE_FLASHINFER:
+            raise SystemExit(
+                f"--{resolved_accuracy_profile.replace('_', '-')} implies "
+                "accuracy_mode=flashinfer and cannot be combined with "
+                "--accuracy-mode allclose."
+            )
+        profile_arch = (
+            _detect_accuracy_arch()
+            if resolved_accuracy_arch == "auto"
+            else resolved_accuracy_arch
+        )
+        profile, resolved_profile_bucket = resolve_accuracy_profile(
+            resolved_accuracy_profile, profile_arch
+        )
+        args.accuracy_mode = ACCURACY_MODE_FLASHINFER
+        # Publish the implied mode (and the dtype-tier flag below) to workers.
+        accuracy_mode_explicit = True
+        if profile.atol is not None and not atol_is_explicit:
+            args.atol = float(profile.atol)
+            # Profile tolerances count as explicit: they must win over the
+            # per-dtype tiers (a bf16 tier of 1e-2 would be wrong for
+            # fp4-quantized attention outputs).
+            atol_is_explicit = True
+        if profile.rtol is not None and not rtol_is_explicit:
+            args.rtol = float(profile.rtol)
+            rtol_is_explicit = True
+        if profile.max_mismatch_pct is not None and not accuracy_mmp_explicit:
+            args.accuracy_max_mismatch_pct = float(profile.max_mismatch_pct)
+            accuracy_mmp_explicit = True
+        if profile.min_cos_sim is not None and not accuracy_mcs_explicit:
+            args.accuracy_min_cos_sim = float(profile.min_cos_sim)
+            accuracy_mcs_explicit = True
+        if profile.max_mean_abs_err is not None and not accuracy_mae_explicit:
+            args.accuracy_max_mean_abs_err = float(profile.max_mean_abs_err)
+            accuracy_mae_explicit = True
     # Per-dtype FlashInfer tolerance tiers apply only in flashinfer mode and
     # only when the user supplied neither atol nor rtol explicitly.
     accuracy_dtype_tolerances = (
@@ -4982,6 +5145,13 @@ def main() -> None:
         )
     if accuracy_mcs_explicit:
         os.environ[ACCURACY_MIN_COS_SIM_ENV] = str(args.accuracy_min_cos_sim)
+    if accuracy_mae_explicit:
+        os.environ[ACCURACY_MAX_MEAN_ABS_ERR_ENV] = str(
+            args.accuracy_max_mean_abs_err
+        )
+    if resolved_accuracy_profile is not None:
+        os.environ[ACCURACY_PROFILE_ENV] = resolved_accuracy_profile
+        os.environ[ACCURACY_PROFILE_ARCH_ENV] = str(resolved_profile_bucket)
 
     if args.torch_compile_shape_worker:
         missing = [
