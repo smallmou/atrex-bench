@@ -35,6 +35,37 @@ from atrex_bench.eval.reward_hack import (
 _DEFAULT_CANDIDATE_TIMEOUT_S = 60
 CORRECTNESS_MAX_REL_L2_ENV = "ATREX_CORRECTNESS_MAX_REL_L2"
 
+# ---------------------------------------------------------------------------
+# Accuracy mode: opt-in FlashInfer-style multi-criteria correctness checking.
+#
+# Ported from flashinfer-ai/flashinfer (Apache-2.0):
+#   * ``flashinfer_default_tolerances``  <- flashinfer/trace/template.py
+#     ::default_tolerances — per-dtype (rtol, atol) tiers, "intentionally
+#     conservative for low-precision inference data types".
+#   * ``_cosine_similarity``             <- flashinfer/trace/template.py
+#     ::_cosine_similarity — non-finite-filtered flattened cosine.
+#   * The pass rule (elementwise isclose mismatch PERCENTAGE below a cap AND
+#     cosine similarity above a floor) <- flashinfer/trace/template.py
+#     ::default_check. Defaults mirror it: max_mismatch_pct=0.0 and
+#     min_cos_sim=1-1e-3; FlashInfer's GEMM convention (cos-only) is
+#     expressible as max_mismatch_pct=100.0 + min_cos_sim=0.99.
+#
+# Like ``correctness_max_rel_l2``, the mode travels to worker subprocesses
+# through environment variables (workers inherit os.environ); the defaults
+# preserve the historical allclose behaviour exactly.
+# ---------------------------------------------------------------------------
+ACCURACY_MODE_ENV = "ATREX_ACCURACY_MODE"
+ACCURACY_MAX_MISMATCH_PCT_ENV = "ATREX_ACCURACY_MAX_MISMATCH_PCT"
+ACCURACY_MIN_COS_SIM_ENV = "ATREX_ACCURACY_MIN_COS_SIM"
+ACCURACY_DTYPE_TOLERANCES_ENV = "ATREX_ACCURACY_DTYPE_TOLERANCES"
+
+ACCURACY_MODE_ALLCLOSE = "allclose"
+ACCURACY_MODE_FLASHINFER = "flashinfer"
+ACCURACY_MODES = (ACCURACY_MODE_ALLCLOSE, ACCURACY_MODE_FLASHINFER)
+
+# flashinfer default_check's signature default: min_cos_sim = 1.0 - 1e-3.
+FLASHINFER_DEFAULT_MIN_COS_SIM = 1.0 - 1e-3
+
 
 @dataclass(frozen=True)
 class OutputDiff:
@@ -45,6 +76,11 @@ class OutputDiff:
     ``max_elementwise_rel_diff`` / ``error``. dtype / shape are intentionally
     not recorded — they are derivable from metadata.json.output_dtypes and
     do not have a real consumer.
+
+    ``mismatch_pct`` / ``cos_sim`` are additive diagnostics recorded only in
+    ``accuracy_mode=flashinfer`` (None otherwise): the percentage of elements
+    failing the elementwise isclose criterion, and the non-finite-filtered
+    cosine similarity against the reference.
     """
 
     name: str
@@ -52,6 +88,8 @@ class OutputDiff:
     max_elementwise_abs_diff: float | None = None
     max_elementwise_rel_diff: float | None = None
     relative_l2: float | None = None
+    mismatch_pct: float | None = None
+    cos_sim: float | None = None
     error: str | None = None
 
 
@@ -219,6 +257,120 @@ def configured_max_rel_l2(explicit: float | None = None) -> float | None:
     return value
 
 
+def flashinfer_default_tolerances(dtype: torch.dtype) -> tuple[float, float]:
+    """Return FlashInfer-style ``(rtol, atol)`` tiers for one dtype.
+
+    Ported from ``flashinfer/trace/template.py::default_tolerances``. The
+    ladder (1e-7 -> 1e-5 -> 1e-3 -> 1e-2 -> 1e-1 -> 1.0) expresses "each
+    lower precision tier roughly halves the significant bits"; non-float
+    dtypes get (0.0, 0.0), i.e. exact equality.
+    """
+    dtype_name = str(dtype).replace("torch.", "")
+    if dtype_name in ("float64", "double"):
+        return 1e-7, 1e-7
+    if dtype_name in ("float32", "float"):
+        return 1e-5, 1e-5
+    if dtype_name in ("float16", "half"):
+        return 1e-3, 1e-3
+    if dtype_name == "bfloat16":
+        return 1e-2, 1e-2
+    if dtype_name.startswith("float8"):
+        return 1e-1, 1e-1
+    if dtype_name.startswith("float4") or "fp4" in dtype_name:
+        return 1.0, 1.0
+    return 0.0, 0.0
+
+
+def _cosine_similarity(actual: torch.Tensor, expected: torch.Tensor) -> float:
+    """Flattened cosine similarity, ported from FlashInfer's trace template.
+
+    Non-finite entries are filtered from BOTH sides before the dot product
+    (FlashInfer computes in float32; float64 is used here to match the
+    comparison space of ``_compare_output_tensors``). Degenerate cases follow
+    FlashInfer: no finite elements -> 1.0; one side all-zero -> 1.0 iff the
+    filtered tensors are exactly equal, else 0.0.
+    """
+    actual = actual.reshape(-1).to(torch.float64)
+    expected = expected.reshape(-1).to(torch.float64)
+    finite = torch.isfinite(actual) & torch.isfinite(expected)
+    if not bool(finite.any()):
+        return 1.0
+    actual = actual[finite]
+    expected = expected[finite]
+    actual_norm = torch.linalg.vector_norm(actual)
+    expected_norm = torch.linalg.vector_norm(expected)
+    if float(actual_norm.item()) == 0.0 or float(expected_norm.item()) == 0.0:
+        return 1.0 if torch.equal(actual, expected) else 0.0
+    return float(((actual * expected).sum() / (actual_norm * expected_norm)).item())
+
+
+def configured_accuracy_mode(explicit: str | None = None) -> str:
+    """Resolve the accuracy mode: explicit arg > env > ``allclose``."""
+    if explicit is not None:
+        mode = str(explicit)
+    else:
+        mode = os.environ.get(ACCURACY_MODE_ENV) or ACCURACY_MODE_ALLCLOSE
+    if mode not in ACCURACY_MODES:
+        raise ValueError(
+            f"accuracy_mode must be one of {list(ACCURACY_MODES)}, got {mode!r}"
+        )
+    return mode
+
+
+def configured_accuracy_max_mismatch_pct(explicit: float | None = None) -> float:
+    """Resolve the FlashInfer-style mismatch-percentage cap (default 0.0)."""
+    if explicit is not None:
+        value = float(explicit)
+    else:
+        raw = os.environ.get(ACCURACY_MAX_MISMATCH_PCT_ENV)
+        if raw is None or not raw.strip():
+            return 0.0
+        value = float(raw)
+    if value < 0 or value > 100:
+        raise ValueError("accuracy max_mismatch_pct must be within [0, 100]")
+    return value
+
+
+def configured_accuracy_min_cos_sim(explicit: float | None = None) -> float | None:
+    """Resolve the user-configured cosine floor, or None when unset.
+
+    None does NOT mean "no floor" in flashinfer mode — see
+    ``effective_accuracy_min_cos_sim``, which applies FlashInfer's
+    ``default_check`` signature default (1 - 1e-3) there. A configured floor
+    <= -1.0 disables the criterion (cosine is mathematically >= -1).
+    """
+    if explicit is not None:
+        return float(explicit)
+    raw = os.environ.get(ACCURACY_MIN_COS_SIM_ENV)
+    if raw is None or not raw.strip():
+        return None
+    return float(raw)
+
+
+def effective_accuracy_min_cos_sim(
+    accuracy_mode: str, explicit: float | None = None
+) -> float | None:
+    """Cosine floor actually enforced: FlashInfer's 0.999 default in fi mode."""
+    configured = configured_accuracy_min_cos_sim(explicit)
+    if accuracy_mode == ACCURACY_MODE_FLASHINFER and configured is None:
+        return FLASHINFER_DEFAULT_MIN_COS_SIM
+    return configured
+
+
+def configured_accuracy_dtype_tolerances(explicit: bool | None = None) -> bool:
+    """Whether flashinfer mode should use per-dtype tiers instead of atol/rtol.
+
+    Set by ``run_eval.main()`` only when ``accuracy_mode=flashinfer`` AND the
+    user supplied neither ``--atol`` nor ``--rtol`` (CLI or config), so an
+    explicit tolerance always wins — matching FlashInfer's ``default_check``,
+    where explicit rtol/atol override ``default_tolerances(dtype)``.
+    """
+    if explicit is not None:
+        return bool(explicit)
+    raw = os.environ.get(ACCURACY_DTYPE_TOLERANCES_ENV)
+    return raw is not None and raw.strip() == "1"
+
+
 def _compare_output_tensors(
     reference_tensor: torch.Tensor,
     candidate_tensor: torch.Tensor,
@@ -228,8 +380,23 @@ def _compare_output_tensors(
     rtol: float,
     max_rel_l2: float | None = None,
     strict_dtype: bool = False,
+    accuracy_mode: str = ACCURACY_MODE_ALLCLOSE,
+    max_mismatch_pct: float = 0.0,
+    min_cos_sim: float | None = None,
+    dtype_tolerances: bool = False,
 ) -> OutputDiff:
-    """Compare a pair of output tensors and return the per-output diff record."""
+    """Compare a pair of output tensors and return the per-output diff record.
+
+    ``accuracy_mode=flashinfer`` replaces the single-criterion verdict with
+    FlashInfer's ``default_check`` semantics: the elementwise isclose
+    mismatch PERCENTAGE must not exceed ``max_mismatch_pct`` AND (when set)
+    the cosine similarity must reach ``min_cos_sim``. With
+    ``dtype_tolerances=True`` the isclose rtol/atol come from
+    ``flashinfer_default_tolerances`` on the candidate dtype (reference dtype
+    when the candidate is non-float) instead of the global atol/rtol. The
+    diagnostic metrics (max abs/rel diff, relative_l2) are recorded in every
+    mode; ``mismatch_pct``/``cos_sim`` only in flashinfer mode.
+    """
     if strict_dtype and reference_tensor.dtype != candidate_tensor.dtype:
         return OutputDiff(
             name=name,
@@ -280,10 +447,41 @@ def _compare_output_tensors(
         )
         diff_l2 = torch.linalg.vector_norm(reference_float - candidate_float)
         relative_l2 = float((diff_l2 / reference_norm.clamp_min(1e-12)).item())
-        passed = (
-            relative_l2 <= max_rel_l2
-            if max_rel_l2 is not None
-            else bool(
+        mismatch_pct: float | None = None
+        cos_sim: float | None = None
+        if accuracy_mode == ACCURACY_MODE_FLASHINFER:
+            # FlashInfer default_check semantics, in this module's float64
+            # comparison space: criterion 1 caps the fraction of elements
+            # failing isclose; criterion 2 floors the flattened cosine.
+            if dtype_tolerances:
+                tier_dtype = (
+                    candidate_tensor.dtype
+                    if torch.is_floating_point(candidate_tensor)
+                    else reference_tensor.dtype
+                )
+                eff_rtol, eff_atol = flashinfer_default_tolerances(tier_dtype)
+            else:
+                eff_rtol, eff_atol = rtol, atol
+            if reference_float.numel():
+                close = torch.isclose(
+                    candidate_float,
+                    reference_float,
+                    rtol=eff_rtol,
+                    atol=eff_atol,
+                )
+                mismatch_pct = 100.0 * (
+                    1.0 - close.to(torch.float64).mean().item()
+                )
+            else:
+                mismatch_pct = 0.0
+            cos_sim = _cosine_similarity(candidate_tensor, reference_tensor)
+            passed = mismatch_pct <= max_mismatch_pct and (
+                min_cos_sim is None or cos_sim >= min_cos_sim
+            )
+        elif max_rel_l2 is not None:
+            passed = relative_l2 <= max_rel_l2
+        else:
+            passed = bool(
                 torch.allclose(
                     reference_float,
                     candidate_float,
@@ -291,7 +489,6 @@ def _compare_output_tensors(
                     rtol=rtol,
                 )
             )
-        )
         if candidate_is_zero and not passed:
             error = "Candidate output is all zero while reference output is non-zero"
     else:
@@ -299,6 +496,8 @@ def _compare_output_tensors(
         max_elementwise_abs_diff = 0.0 if passed else 1.0
         max_elementwise_rel_diff = 0.0 if passed else 1.0
         relative_l2 = None
+        mismatch_pct = None
+        cos_sim = None
 
     return OutputDiff(
         name=name,
@@ -306,6 +505,8 @@ def _compare_output_tensors(
         max_elementwise_abs_diff=max_elementwise_abs_diff,
         max_elementwise_rel_diff=max_elementwise_rel_diff,
         relative_l2=relative_l2,
+        mismatch_pct=mismatch_pct,
+        cos_sim=cos_sim,
         error=error,
     )
 
@@ -322,6 +523,10 @@ def _compare_value_trees(
     output_tolerances=None,
     tolerance_name=None,
     matched_tolerance_paths=None,
+    accuracy_mode=ACCURACY_MODE_ALLCLOSE,
+    max_mismatch_pct=0.0,
+    min_cos_sim=None,
+    dtype_tolerances=False,
 ):
     """Compare return values, with exact types for explicit mutation contracts."""
     try:
@@ -346,6 +551,10 @@ def _compare_value_trees(
                 output_tolerances=output_tolerances,
                 tolerance_name=f"{logical_name}.{key}",
                 matched_tolerance_paths=matched_tolerance_paths,
+                accuracy_mode=accuracy_mode,
+                max_mismatch_pct=max_mismatch_pct,
+                min_cos_sim=min_cos_sim,
+                dtype_tolerances=dtype_tolerances,
             )
         ]
     if isinstance(reference, (list, tuple)):
@@ -363,6 +572,10 @@ def _compare_value_trees(
                 output_tolerances=output_tolerances,
                 tolerance_name=f"{logical_name}[{index}]",
                 matched_tolerance_paths=matched_tolerance_paths,
+                accuracy_mode=accuracy_mode,
+                max_mismatch_pct=max_mismatch_pct,
+                min_cos_sim=min_cos_sim,
+                dtype_tolerances=dtype_tolerances,
             )
         ]
     if reference is None:
@@ -383,6 +596,12 @@ def _compare_value_trees(
             rtol=tolerance.rtol if tolerance is not None else rtol,
             max_rel_l2=max_rel_l2,
             strict_dtype=strict_types,
+            accuracy_mode=accuracy_mode,
+            max_mismatch_pct=max_mismatch_pct,
+            min_cos_sim=min_cos_sim,
+            # A metadata-owned per-path tolerance is explicit by definition:
+            # it wins over the flashinfer per-dtype tiers.
+            dtype_tolerances=dtype_tolerances and tolerance is None,
         )
     ]
 
@@ -530,6 +749,10 @@ def check_correctness(
     candidate_timeout_s: int | float | None = _DEFAULT_CANDIDATE_TIMEOUT_S,
     max_rel_l2: float | None = None,
     untrusted_mode: bool = False,
+    accuracy_mode: str | None = None,
+    accuracy_max_mismatch_pct: float | None = None,
+    accuracy_min_cos_sim: float | None = None,
+    accuracy_dtype_tolerances: bool | None = None,
 ) -> CorrectnessShapeResult:
     """Compare candidate outputs against the eager reference baseline for one shape.
 
@@ -537,6 +760,12 @@ def check_correctness(
     Synthetic inline references without a sibling shapes.json fall back to the
     legacy ``get_inputs()`` / ``get_init_inputs()`` path; ``shape_id`` is then
     informational only.
+
+    The ``accuracy_*`` arguments are optional overrides for the FlashInfer-style
+    check mode; when None they are read from the ``ATREX_ACCURACY_*``
+    environment variables (set by ``run_eval.main()``), defaulting to the
+    historical allclose behaviour. ``accuracy_mode=flashinfer`` is mutually
+    exclusive with ``max_rel_l2``.
     """
     if num_correctness_cases < 1:
         return CorrectnessShapeResult(
@@ -551,8 +780,30 @@ def check_correctness(
             load_minimum_correctness_cases(reference_path),
         )
         effective_max_rel_l2 = configured_max_rel_l2(max_rel_l2)
+        effective_accuracy_mode = configured_accuracy_mode(accuracy_mode)
+        effective_max_mismatch_pct = configured_accuracy_max_mismatch_pct(
+            accuracy_max_mismatch_pct
+        )
+        effective_min_cos_sim = effective_accuracy_min_cos_sim(
+            effective_accuracy_mode, accuracy_min_cos_sim
+        )
+        effective_dtype_tolerances = configured_accuracy_dtype_tolerances(
+            accuracy_dtype_tolerances
+        )
     except (OSError, TypeError, ValueError) as error:
         return CorrectnessShapeResult(status="failed", reason=str(error))
+    if (
+        effective_accuracy_mode == ACCURACY_MODE_FLASHINFER
+        and effective_max_rel_l2 is not None
+    ):
+        return CorrectnessShapeResult(
+            status="failed",
+            reason=(
+                "accuracy_mode=flashinfer cannot be combined with "
+                "correctness_max_rel_l2 (the flashinfer criteria replace the "
+                "single global relative-L2 threshold)"
+            ),
+        )
 
     try:
         resolved_device = get_device(device)
@@ -723,6 +974,10 @@ def check_correctness(
                 strict_types=strict_types,
                 output_tolerances=output_tolerances,
                 matched_tolerance_paths=matched_tolerance_paths,
+                accuracy_mode=effective_accuracy_mode,
+                max_mismatch_pct=effective_max_mismatch_pct,
+                min_cos_sim=effective_min_cos_sim,
+                dtype_tolerances=effective_dtype_tolerances,
             )
             output_diffs = [
                 replace(diff, name=_flatten_output_name(diff.name)) for diff in output_diffs
@@ -745,6 +1000,10 @@ def check_correctness(
                             output_tolerances=output_tolerances,
                             tolerance_name=f"mutated_inputs.{key}",
                             matched_tolerance_paths=matched_tolerance_paths,
+                            accuracy_mode=effective_accuracy_mode,
+                            max_mismatch_pct=effective_max_mismatch_pct,
+                            min_cos_sim=effective_min_cos_sim,
+                            dtype_tolerances=effective_dtype_tolerances,
                         )
                     )
                 elif key in scratch_inputs:

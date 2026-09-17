@@ -629,3 +629,222 @@ def test_dict_outputs_with_mismatched_keys_reports_key_mismatch(tmp_path: Path) 
     assert "dict keys differ" in case_error
     assert "missing in candidate" in case_error
     assert "extra in candidate" in case_error
+
+
+# ---------------------------------------------------------------------------
+# accuracy_mode=flashinfer: ported FlashInfer default_check semantics
+# ---------------------------------------------------------------------------
+
+import pytest  # noqa: E402  (appended section keeps imports local to the block)
+import torch  # noqa: E402
+
+from atrex_bench.eval.correctness import (  # noqa: E402
+    ACCURACY_DTYPE_TOLERANCES_ENV,
+    ACCURACY_MODE_ENV,
+    ACCURACY_MODE_FLASHINFER,
+    _cosine_similarity,
+    flashinfer_default_tolerances,
+)
+
+
+def _write_pair(
+    tmp_path: Path, *, ref_forward: str, cand_forward: str, inputs: str
+) -> tuple[Path, Path]:
+    """Write a reference/candidate pair sharing one get_inputs() definition."""
+    header = ["import torch", "import torch.nn as nn", "", "class Model(nn.Module):"]
+    tail = [
+        "",
+        "def get_inputs():",
+        f"    return [{inputs}]",
+        "",
+        "def get_init_inputs():",
+        "    return []",
+    ]
+    reference_path = _write_python_file(
+        tmp_path,
+        "reference.py",
+        "\n".join(header + ["    def forward(self, x):", f"        return {ref_forward}"] + tail),
+    )
+    candidate_path = _write_python_file(
+        tmp_path,
+        "candidate.py",
+        "\n".join(header + ["    def forward(self, x):", f"        return {cand_forward}"] + tail),
+    )
+    return reference_path, candidate_path
+
+
+def test_flashinfer_default_tolerances_ladder() -> None:
+    """The ported tier table matches flashinfer/trace/template.py exactly."""
+    assert flashinfer_default_tolerances(torch.float64) == (1e-7, 1e-7)
+    assert flashinfer_default_tolerances(torch.float32) == (1e-5, 1e-5)
+    assert flashinfer_default_tolerances(torch.float16) == (1e-3, 1e-3)
+    assert flashinfer_default_tolerances(torch.bfloat16) == (1e-2, 1e-2)
+    assert flashinfer_default_tolerances(torch.float8_e4m3fn) == (1e-1, 1e-1)
+    # Non-float dtypes fall through to exact equality.
+    assert flashinfer_default_tolerances(torch.int64) == (0.0, 0.0)
+
+
+def test_cosine_similarity_helper() -> None:
+    ref = torch.ones(8, dtype=torch.float64)
+    assert _cosine_similarity(ref, ref) == pytest.approx(1.0)
+    assert _cosine_similarity(ref * 1.2, ref) == pytest.approx(1.0)  # scale-invariant
+    assert _cosine_similarity(-ref, ref) == pytest.approx(-1.0)
+    assert _cosine_similarity(torch.zeros(8, dtype=torch.float64), ref) == 0.0
+    # Non-finite entries are filtered from both sides before the dot product.
+    noisy = ref.clone()
+    noisy[0] = float("nan")
+    ref_noisy = ref.clone()
+    ref_noisy[0] = float("inf")
+    assert _cosine_similarity(noisy, ref_noisy) == pytest.approx(1.0)
+
+
+def test_flashinfer_mode_exact_match_records_diagnostics(tmp_path: Path) -> None:
+    reference_path, candidate_path = _write_pair(
+        tmp_path, ref_forward="x + 1.0", cand_forward="x + 1.0", inputs="torch.zeros(4, 4)"
+    )
+    result = check_correctness(
+        reference_path,
+        candidate_path,
+        device="cpu",
+        accuracy_mode=ACCURACY_MODE_FLASHINFER,
+    )
+    assert result.status == "passed"
+    diff = result.cases[0].outputs[0]
+    assert diff.passed is True
+    assert diff.mismatch_pct == 0.0
+    assert diff.cos_sim == pytest.approx(1.0)
+
+
+def test_flashinfer_dtype_tolerances_are_stricter_than_global(tmp_path: Path) -> None:
+    """A 1e-4 perturbation passes global atol=1e-2 but fails the fp32 tier (1e-5)."""
+    reference_path, candidate_path = _write_pair(
+        tmp_path, ref_forward="x + 1.0", cand_forward="x + 1.0001", inputs="torch.zeros(4, 4)"
+    )
+    strict = check_correctness(
+        reference_path,
+        candidate_path,
+        device="cpu",
+        accuracy_mode=ACCURACY_MODE_FLASHINFER,
+        accuracy_dtype_tolerances=True,
+    )
+    assert strict.status == "failed"
+    assert strict.cases[0].outputs[0].mismatch_pct == pytest.approx(100.0)
+
+    lenient = check_correctness(
+        reference_path,
+        candidate_path,
+        device="cpu",
+        accuracy_mode=ACCURACY_MODE_FLASHINFER,
+        accuracy_dtype_tolerances=False,  # explicit/global atol-rtol win
+    )
+    assert lenient.status == "passed"
+
+
+def test_flashinfer_max_mismatch_pct_tolerates_outliers(tmp_path: Path) -> None:
+    """10% of elements wrong: fails strict, passes with a 15% cap and cosine off."""
+    reference_path, candidate_path = _write_pair(
+        tmp_path,
+        ref_forward="x",
+        cand_forward="x * (torch.arange(x.numel(), dtype=x.dtype)"
+        " .reshape(x.shape) >= x.numel() // 10)",
+        inputs="torch.ones(10, 100)",
+    )
+    strict = check_correctness(
+        reference_path,
+        candidate_path,
+        device="cpu",
+        accuracy_mode=ACCURACY_MODE_FLASHINFER,
+    )
+    assert strict.status == "failed"
+    strict_diff = strict.cases[0].outputs[0]
+    assert strict_diff.mismatch_pct == pytest.approx(10.0)
+    # Cosine of 90%-ones vs all-ones is ~0.9487 < the 0.999 default floor, so
+    # the mismatch cap alone must not flip the verdict.
+    capped_only = check_correctness(
+        reference_path,
+        candidate_path,
+        device="cpu",
+        accuracy_mode=ACCURACY_MODE_FLASHINFER,
+        accuracy_max_mismatch_pct=15.0,
+    )
+    assert capped_only.status == "failed"
+    assert capped_only.cases[0].outputs[0].cos_sim < 0.999
+
+    passing = check_correctness(
+        reference_path,
+        candidate_path,
+        device="cpu",
+        accuracy_mode=ACCURACY_MODE_FLASHINFER,
+        accuracy_max_mismatch_pct=15.0,
+        accuracy_min_cos_sim=-1.0,  # disables the cosine criterion
+    )
+    assert passing.status == "passed"
+
+
+def test_flashinfer_cosine_only_gemm_convention(tmp_path: Path) -> None:
+    """FlashInfer GEMM convention: mismatch cap 100% + cos floor 0.99."""
+    reference_path, candidate_path = _write_pair(
+        tmp_path, ref_forward="x", cand_forward="x * 1.2", inputs="torch.ones(10, 10)"
+    )
+    default = check_correctness(
+        reference_path,
+        candidate_path,
+        device="cpu",
+        accuracy_mode=ACCURACY_MODE_FLASHINFER,
+    )
+    # Uniform 20% overshoot: every element fails isclose, cosine is exactly 1.
+    assert default.status == "failed"
+    assert default.cases[0].outputs[0].mismatch_pct == pytest.approx(100.0)
+    assert default.cases[0].outputs[0].cos_sim == pytest.approx(1.0)
+
+    gemm_style = check_correctness(
+        reference_path,
+        candidate_path,
+        device="cpu",
+        accuracy_mode=ACCURACY_MODE_FLASHINFER,
+        accuracy_max_mismatch_pct=100.0,
+        accuracy_min_cos_sim=0.99,
+    )
+    assert gemm_style.status == "passed"
+
+
+def test_flashinfer_mode_rejects_max_rel_l2_combination(tmp_path: Path) -> None:
+    reference_path, candidate_path = _write_pair(
+        tmp_path, ref_forward="x + 1.0", cand_forward="x + 1.0", inputs="torch.zeros(4, 4)"
+    )
+    result = check_correctness(
+        reference_path,
+        candidate_path,
+        device="cpu",
+        accuracy_mode=ACCURACY_MODE_FLASHINFER,
+        max_rel_l2=0.1,
+    )
+    assert result.status == "failed"
+    assert "cannot be combined" in (result.reason or "")
+
+
+def test_flashinfer_mode_env_channel(tmp_path: Path, monkeypatch) -> None:
+    """The ATREX_ACCURACY_* env vars (worker channel) drive the same engine."""
+    reference_path, candidate_path = _write_pair(
+        tmp_path, ref_forward="x + 1.0", cand_forward="x + 1.0001", inputs="torch.zeros(4, 4)"
+    )
+    monkeypatch.setenv(ACCURACY_MODE_ENV, "flashinfer")
+    monkeypatch.setenv(ACCURACY_DTYPE_TOLERANCES_ENV, "1")
+    result = check_correctness(reference_path, candidate_path, device="cpu")
+    assert result.status == "failed"
+    assert result.cases[0].outputs[0].mismatch_pct == pytest.approx(100.0)
+
+    monkeypatch.delenv(ACCURACY_MODE_ENV)
+    monkeypatch.delenv(ACCURACY_DTYPE_TOLERANCES_ENV)
+    baseline = check_correctness(reference_path, candidate_path, device="cpu")
+    assert baseline.status == "passed"
+    assert baseline.cases[0].outputs[0].mismatch_pct is None
+
+
+def test_allclose_mode_leaves_flashinfer_diagnostics_unset(tmp_path: Path) -> None:
+    """Default mode payload stays exactly as before: no mismatch/cos fields."""
+    result = check_correctness(REFERENCE_PATH, CANDIDATE_PATH, device="cpu")
+    assert result.status == "passed"
+    for diff in result.cases[0].outputs:
+        assert diff.mismatch_pct is None
+        assert diff.cos_sim is None

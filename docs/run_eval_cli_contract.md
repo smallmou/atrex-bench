@@ -35,6 +35,9 @@ start an evaluation, the subprocess fails abnormally, or the result artifacts ar
 | `reference_dir` | path | Always | Reference directory. Must contain `reference.py`, `input.py`, `shapes.json`, and `metadata.json`. |
 | `output` | path | Always | Root directory for evaluation artifacts. |
 | `checkpoint_dir` | path | Optional | Root directory for correctness/performance checkpoints. |
+| `accuracy_mode` | enum | Optional | `allclose` (default) or `flashinfer`; selects the correctness verdict engine. See Section 4.1. |
+| `accuracy_max_mismatch_pct` | float | Optional | `flashinfer` mode only: allowed percentage of elements failing the elementwise criterion. Default `0.0`. |
+| `accuracy_min_cos_sim` | float | Optional | `flashinfer` mode only: cosine-similarity floor. Default `0.999`; `<= -1.0` disables. |
 
 The candidate file must expose `class Model`.
 
@@ -72,7 +75,10 @@ result; partial runs remain available as artifacts but are not aggregated.
 |---|---:|---:|---|
 | `--atol` | float | `0.01` | Absolute tolerance for correctness checks. |
 | `--rtol` | float | `0.05` | Relative tolerance for correctness checks. |
-| `--correctness-max-rel-l2` | float | Unset | When set, applies a global relative L2 threshold to floating-point outputs. |
+| `--correctness-max-rel-l2` | float | Unset | When set, applies a global relative L2 threshold to floating-point outputs. Cannot be combined with `--accuracy-mode flashinfer`. |
+| `--accuracy-mode` | enum | `allclose` | Allowed values: `allclose`, `flashinfer`. Selects the correctness verdict engine; see Section 4.1. |
+| `--accuracy-max-mismatch-pct` | float | `0.0` | `accuracy-mode=flashinfer`. Percentage of elements allowed to fail the elementwise isclose criterion. `100.0` makes the verdict cosine-only. |
+| `--accuracy-min-cos-sim` | float | `0.999` | `accuracy-mode=flashinfer`. Cosine-similarity floor for floating-point outputs. A value `<= -1.0` disables the criterion. |
 | `--num-correctness-cases` | int | `1` | Number of correctness cases per shape. |
 | `--warmup-iters` | int | `10` | Performance warmup budget. **In `eager` mode, the unit is milliseconds, not iterations** (the `warmup` argument to Triton's `do_bench`, documented as "Warmup time (in ms)"). In `cuda_graph_replay` mode, it is the number of replays. |
 | `--bench-iters` | int | `100` | Performance benchmark budget. **In `eager` mode, the unit is milliseconds, not iterations** (the `rep` argument to `do_bench`, documented as "Repetition time (in ms)"). Thus, `--bench-iters 100` requests approximately 100 ms of measurement: a fast kernel may run thousands of times, while a slow kernel may run only once. The length of `samples` in `eval_result.json` gives the recorded sample count. In `cuda_graph_replay` mode, this option is the number of replays. The option name predates this distinction and is retained for compatibility. |
@@ -88,6 +94,63 @@ stdout/stderr pipes after the worker exits. A supervising worker gets up to one
 second to clean up its separately grouped shape worker before SIGKILL, followed
 by bounded process/pipe cleanup. This is not a sandbox: descendants that explicitly
 detach into another session are outside the original process group.
+
+### 4.1 Accuracy Modes
+
+`--accuracy-mode` selects the correctness verdict engine. The default
+(`allclose`) preserves the historical behaviour bit-for-bit: a floating-point
+output passes iff `torch.allclose(reference, candidate, atol, rtol)` — or iff
+`relative_l2 <= correctness_max_rel_l2` when that threshold is set. Non-float
+outputs require exact equality in both modes.
+
+`--accuracy-mode flashinfer` ports the multi-criteria check engine of
+[FlashInfer](https://github.com/flashinfer-ai/flashinfer) (Apache-2.0),
+mirroring `flashinfer/trace/template.py::default_check`. A floating-point
+output passes iff BOTH criteria hold:
+
+1. **Elementwise mismatch percentage** — the fraction of elements failing
+   `isclose(candidate, reference, rtol, atol)` must not exceed
+   `--accuracy-max-mismatch-pct` (default `0.0`, i.e. strict allclose-style
+   elementwise checking; FlashInfer's GEMM convention uses `100.0` to make
+   the verdict cosine-only).
+2. **Cosine similarity floor** — the flattened, non-finite-filtered cosine
+   similarity against the reference must reach `--accuracy-min-cos-sim`
+   (default `0.999`, FlashInfer's `default_check` signature default; their
+   GEMM templates use `0.99`/`0.98`/`0.97` for bf16-fp8/mxfp8/fp4). A value
+   `<= -1.0` disables this criterion.
+
+Effective tolerances: when neither `--atol` nor `--rtol` is explicitly
+supplied (CLI or config), flashinfer mode replaces the global defaults with
+FlashInfer's per-dtype tiers (`default_tolerances`), keyed on the candidate
+output dtype:
+
+| dtype | rtol | atol |
+|---|---:|---:|
+| float64 | 1e-7 | 1e-7 |
+| float32 | 1e-5 | 1e-5 |
+| float16 | 1e-3 | 1e-3 |
+| bfloat16 | 1e-2 | 1e-2 |
+| float8* | 1e-1 | 1e-1 |
+| float4/fp4 | 1.0 | 1.0 |
+
+An explicitly supplied `--atol`/`--rtol` always wins over the tiers (matching
+FlashInfer, where explicit tolerances override `default_tolerances`).
+
+Additional semantics:
+
+- flashinfer mode is mutually exclusive with `--correctness-max-rel-l2`
+  (the two criteria replace the single global relative-L2 threshold).
+- The existing hard guards are unchanged: non-finite outputs fail, the
+  all-zero-candidate diagnostic still fires, and structural mismatches
+  abort the remaining cases.
+- Per-output diagnostics `mismatch_pct` and `cos_sim` are recorded in
+  `eval_result.json` (null in allclose mode); `max_elementwise_abs_diff`,
+  `max_elementwise_rel_diff`, and `relative_l2` are recorded in both modes.
+- The resolved policy (mode, caps, and whether dtype tiers are active) is
+  recorded in the `runner_config` block of `eval_result.json` and travels to
+  worker subprocesses via `ATREX_ACCURACY_*` environment variables, the same
+  channel as `ATREX_CORRECTNESS_MAX_REL_L2`. It applies uniformly to
+  candidate, ABBA, and mutated-input comparisons.
 
 ## 5. Advanced Performance Options
 

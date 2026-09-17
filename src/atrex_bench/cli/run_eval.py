@@ -62,8 +62,19 @@ from atrex_bench.eval.clock_lock import (
 )
 from atrex_bench.eval.clock_monitor import NvidiaClockMonitor
 from atrex_bench.eval.correctness import (
+    ACCURACY_DTYPE_TOLERANCES_ENV,
+    ACCURACY_MAX_MISMATCH_PCT_ENV,
+    ACCURACY_MIN_COS_SIM_ENV,
+    ACCURACY_MODE_ENV,
+    ACCURACY_MODE_FLASHINFER,
+    ACCURACY_MODES,
     CORRECTNESS_MAX_REL_L2_ENV,
+    configured_accuracy_dtype_tolerances,
+    configured_accuracy_max_mismatch_pct,
+    configured_accuracy_min_cos_sim,
+    configured_accuracy_mode,
     configured_max_rel_l2,
+    effective_accuracy_min_cos_sim,
     load_minimum_correctness_cases,
     metadata_owns_correctness,
 )
@@ -136,6 +147,9 @@ _RUNNER_CONFIG_KEYS = frozenset(
         "atol",
         "rtol",
         "correctness_max_rel_l2",
+        "accuracy_mode",
+        "accuracy_max_mismatch_pct",
+        "accuracy_min_cos_sim",
         "num_correctness_cases",
         "warmup_iters",
         "bench_iters",
@@ -1200,6 +1214,12 @@ def _build_runner_config(
         "atol": atol,
         "rtol": rtol,
         "correctness_max_rel_l2": configured_max_rel_l2(),
+        "accuracy_mode": configured_accuracy_mode(),
+        "accuracy_max_mismatch_pct": configured_accuracy_max_mismatch_pct(),
+        "accuracy_min_cos_sim": effective_accuracy_min_cos_sim(
+            configured_accuracy_mode()
+        ),
+        "accuracy_dtype_tolerances": configured_accuracy_dtype_tolerances(),
         "num_correctness_cases": num_correctness_cases,
         "warmup_iters": warmup_iters,
         "bench_iters": bench_iters,
@@ -4296,6 +4316,45 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--accuracy-mode",
+        type=str,
+        default=None,
+        choices=list(ACCURACY_MODES),
+        help=(
+            "Correctness verdict engine. 'allclose' (default) keeps the "
+            "historical atol/rtol allclose (or --correctness-max-rel-l2) "
+            "behaviour. 'flashinfer' ports FlashInfer's trace-template "
+            "default_check: per-output pass = elementwise isclose mismatch "
+            "percentage <= --accuracy-max-mismatch-pct AND cosine similarity "
+            ">= --accuracy-min-cos-sim. When neither --atol nor --rtol is "
+            "explicitly supplied, flashinfer mode uses FlashInfer's per-dtype "
+            "tolerance tiers (fp64 1e-7 / fp32 1e-5 / fp16 1e-3 / bf16 1e-2 "
+            "/ fp8 1e-1 / fp4 1.0) instead of the global atol/rtol. Cannot be "
+            "combined with --correctness-max-rel-l2."
+        ),
+    )
+    parser.add_argument(
+        "--accuracy-max-mismatch-pct",
+        type=float,
+        default=None,
+        help=(
+            "flashinfer accuracy mode only: percentage of elements allowed to "
+            "fail the elementwise isclose criterion (default 0.0 = strict, "
+            "same as FlashInfer's default_check; 100.0 makes the verdict "
+            "cosine-only, matching FlashInfer's GEMM convention)."
+        ),
+    )
+    parser.add_argument(
+        "--accuracy-min-cos-sim",
+        type=float,
+        default=None,
+        help=(
+            "flashinfer accuracy mode only: cosine-similarity floor "
+            "(default 0.999 = FlashInfer's default_check; their GEMM "
+            "convention is 0.99). A value <= -1.0 disables the criterion."
+        ),
+    )
+    parser.add_argument(
         "--num-correctness-cases",
         type=int,
         default=None,
@@ -4652,6 +4711,12 @@ def main() -> None:
     if args.reference_dir is None:
         raise SystemExit("reference_dir is required via --reference-dir or config.")
 
+    # Capture whether atol/rtol were EXPLICITLY supplied (CLI flag or config
+    # key) before the resolver overwrites them with defaults. flashinfer
+    # accuracy mode uses its per-dtype tolerance tiers only when neither was
+    # explicit, so a user-supplied tolerance always wins.
+    atol_is_explicit = args.atol is not None or "atol" in runner_file_config
+    rtol_is_explicit = args.rtol is not None or "rtol" in runner_file_config
     args.atol = float(
         _resolve_runner_option(
             "atol", cli_value=args.atol, config=runner_file_config, default=_DEFAULT_ATOL
@@ -4682,6 +4747,63 @@ def main() -> None:
                 args.correctness_max_rel_l2,
             )
         args.correctness_max_rel_l2 = None
+    # Capture whether the accuracy options were EXPLICITLY supplied (CLI flag
+    # or config key) before resolution overwrites them with defaults. Worker
+    # subprocesses re-enter main() without these flags, so the env publish
+    # below must be conditional — exactly like correctness_max_rel_l2 — or a
+    # worker would clobber the inherited policy with its CLI-derived defaults.
+    accuracy_mode_explicit = (
+        args.accuracy_mode is not None or "accuracy_mode" in runner_file_config
+    )
+    accuracy_mmp_explicit = (
+        args.accuracy_max_mismatch_pct is not None
+        or "accuracy_max_mismatch_pct" in runner_file_config
+    )
+    accuracy_mcs_explicit = (
+        args.accuracy_min_cos_sim is not None
+        or "accuracy_min_cos_sim" in runner_file_config
+    )
+    # Resolve through configured_accuracy_mode so the precedence is
+    # CLI > config > ATREX_ACCURACY_MODE env > allclose, matching how
+    # correctness_max_rel_l2 treats its env channel.
+    resolved_accuracy_mode = _resolve_runner_option(
+        "accuracy_mode",
+        cli_value=args.accuracy_mode,
+        config=runner_file_config,
+        default=None,
+    )
+    args.accuracy_max_mismatch_pct = _resolve_runner_option(
+        "accuracy_max_mismatch_pct",
+        cli_value=args.accuracy_max_mismatch_pct,
+        config=runner_file_config,
+        default=None,
+    )
+    args.accuracy_min_cos_sim = _resolve_runner_option(
+        "accuracy_min_cos_sim",
+        cli_value=args.accuracy_min_cos_sim,
+        config=runner_file_config,
+        default=None,
+    )
+    try:
+        # resolved_accuracy_mode is CLI>config or None; configured_accuracy_mode
+        # then falls back to ATREX_ACCURACY_MODE (inherited by worker
+        # subprocesses) and finally to allclose.
+        args.accuracy_mode = configured_accuracy_mode(resolved_accuracy_mode)
+        args.accuracy_max_mismatch_pct = configured_accuracy_max_mismatch_pct(
+            args.accuracy_max_mismatch_pct
+        )
+        args.accuracy_min_cos_sim = configured_accuracy_min_cos_sim(
+            args.accuracy_min_cos_sim
+        )
+    except (TypeError, ValueError) as error:
+        raise SystemExit(str(error)) from error
+    # Per-dtype FlashInfer tolerance tiers apply only in flashinfer mode and
+    # only when the user supplied neither atol nor rtol explicitly.
+    accuracy_dtype_tolerances = (
+        args.accuracy_mode == ACCURACY_MODE_FLASHINFER
+        and not atol_is_explicit
+        and not rtol_is_explicit
+    )
     args.num_correctness_cases = int(
         _resolve_runner_option(
             "num_correctness_cases",
@@ -4830,10 +4952,36 @@ def main() -> None:
     )
     if args.trust_mode not in {_TRUST_MODE_TRUSTED, _TRUST_MODE_UNTRUSTED}:
         raise SystemExit("trust_mode must be one of: trusted, untrusted")
-    if args.correctness_max_rel_l2 is not None:
+    if args.accuracy_mode == ACCURACY_MODE_FLASHINFER:
+        if args.correctness_max_rel_l2 is not None:
+            raise SystemExit(
+                "--correctness-max-rel-l2 cannot be combined with "
+                "--accuracy-mode flashinfer (the flashinfer criteria replace "
+                "the single global relative-L2 threshold)."
+            )
+    elif args.correctness_max_rel_l2 is not None:
         os.environ[CORRECTNESS_MAX_REL_L2_ENV] = str(
             args.correctness_max_rel_l2
         )
+    # Publish the resolved accuracy policy to worker subprocesses through the
+    # environment (same channel as correctness_max_rel_l2; workers inherit
+    # os.environ). Publish ONLY explicitly-configured values: worker
+    # subprocesses re-enter main() without these flags, and an unconditional
+    # write would let a worker clobber the inherited policy with its own
+    # CLI-derived defaults. The dtype-tolerances flag is especially fragile —
+    # the worker command serializes resolved --atol/--rtol, so a worker would
+    # always recompute it as False.
+    if accuracy_mode_explicit:
+        os.environ[ACCURACY_MODE_ENV] = args.accuracy_mode
+        os.environ[ACCURACY_DTYPE_TOLERANCES_ENV] = (
+            "1" if accuracy_dtype_tolerances else "0"
+        )
+    if accuracy_mmp_explicit:
+        os.environ[ACCURACY_MAX_MISMATCH_PCT_ENV] = str(
+            args.accuracy_max_mismatch_pct
+        )
+    if accuracy_mcs_explicit:
+        os.environ[ACCURACY_MIN_COS_SIM_ENV] = str(args.accuracy_min_cos_sim)
 
     if args.torch_compile_shape_worker:
         missing = [

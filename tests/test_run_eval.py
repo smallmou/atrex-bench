@@ -761,6 +761,127 @@ def test_runner_config_records_correctness_rel_l2_policy(
     assert config["correctness_max_rel_l2"] == 0.2
 
 
+def test_runner_config_records_accuracy_mode_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import run_eval as run_eval_module
+
+    for env_name in (
+        "ATREX_ACCURACY_MODE",
+        "ATREX_ACCURACY_MAX_MISMATCH_PCT",
+        "ATREX_ACCURACY_MIN_COS_SIM",
+        "ATREX_ACCURACY_DTYPE_TOLERANCES",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+
+    config = run_eval_module._build_runner_config(
+        config_version="v1",
+        mode="candidate",
+        atol=1e-2,
+        rtol=0.05,
+        num_correctness_cases=1,
+        warmup_iters=25,
+        bench_iters=50,
+    )
+
+    assert config["accuracy_mode"] == "allclose"
+    assert config["accuracy_max_mismatch_pct"] == 0.0
+    assert config["accuracy_min_cos_sim"] is None
+    assert config["accuracy_dtype_tolerances"] is False
+
+
+def test_runner_config_records_flashinfer_accuracy_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import run_eval as run_eval_module
+
+    monkeypatch.setenv("ATREX_ACCURACY_MODE", "flashinfer")
+    monkeypatch.setenv("ATREX_ACCURACY_MAX_MISMATCH_PCT", "5.0")
+    monkeypatch.setenv("ATREX_ACCURACY_MIN_COS_SIM", "0.99")
+    monkeypatch.setenv("ATREX_ACCURACY_DTYPE_TOLERANCES", "1")
+
+    config = run_eval_module._build_runner_config(
+        config_version="v1",
+        mode="candidate",
+        atol=1e-2,
+        rtol=0.05,
+        num_correctness_cases=1,
+        warmup_iters=25,
+        bench_iters=50,
+    )
+
+    assert config["accuracy_mode"] == "flashinfer"
+    assert config["accuracy_max_mismatch_pct"] == 5.0
+    assert config["accuracy_min_cos_sim"] == 0.99
+    assert config["accuracy_dtype_tolerances"] is True
+
+
+def test_runner_config_flashinfer_mode_defaults_cosine_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unset min-cos-sim records FlashInfer's default_check floor (1 - 1e-3)."""
+    from scripts import run_eval as run_eval_module
+
+    monkeypatch.setenv("ATREX_ACCURACY_MODE", "flashinfer")
+    monkeypatch.delenv("ATREX_ACCURACY_MIN_COS_SIM", raising=False)
+
+    config = run_eval_module._build_runner_config(
+        config_version="v1",
+        mode="candidate",
+        atol=1e-2,
+        rtol=0.05,
+        num_correctness_cases=1,
+        warmup_iters=25,
+        bench_iters=50,
+    )
+
+    assert config["accuracy_min_cos_sim"] == pytest.approx(1.0 - 1e-3)
+
+
+def test_flashinfer_mode_rejects_max_rel_l2_at_cli(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import run_eval as run_eval_module
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_eval.py",
+            "--reference-dir",
+            "reference",
+            "--accuracy-mode",
+            "flashinfer",
+            "--correctness-max-rel-l2",
+            "0.1",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        run_eval_module.main()
+
+    assert "cannot be combined" in str(exc_info.value)
+
+
+def test_invalid_accuracy_mode_is_rejected_by_argparse(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from scripts import run_eval as run_eval_module
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["run_eval.py", "--reference-dir", "reference", "--accuracy-mode", "bogus"],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        run_eval_module.main()
+
+    assert exc_info.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
+
+
 def test_build_environment_records_clock_lock_marker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
